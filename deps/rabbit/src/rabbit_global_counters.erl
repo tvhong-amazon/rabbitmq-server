@@ -17,7 +17,8 @@
          messages_acknowledged/1,
          channel_get_ack/1,
          channel_get_empty/1,
-         channel_messages_delivered_ack/1
+         channel_messages_delivered_ack/1,
+         channel_messages_delivered/1
        ]).
 
 
@@ -27,6 +28,7 @@
 -define(CHANNEL_GET_ACK, 4).
 -define(CHANNEL_GET_EMPTY, 5).
 -define(CHANNEL_MESSAGES_DELIVERED_ACK, 6).
+-define(CHANNEL_MESSAGES_DELIVERED, 7).
 
 -define(COUNTERS,
             [
@@ -53,6 +55,10 @@
                 {
                     channel_messages_delivered_ack_total, ?CHANNEL_MESSAGES_DELIVERED_ACK, counter,
                     "Total number of messages delivered to consumers in manual acknowledgement mode"
+                },
+                {
+                    channel_messages_delivered_total, ?CHANNEL_MESSAGES_DELIVERED, counter,
+                    "Total number of messages delivered to consumers in automatic acknowledgement mode"
                 }
             ]).
 
@@ -101,3 +107,7 @@ channel_get_empty(Num) ->
 
 channel_messages_delivered_ack(Num) ->
     counters:add(persistent_term:get(?MODULE), ?CHANNEL_MESSAGES_DELIVERED_ACK, Num).
+
+% TODO these are auto-ack only but the name doesn't reflect that
+channel_messages_delivered(Num) ->
+    counters:add(persistent_term:get(?MODULE), ?CHANNEL_MESSAGES_DELIVERED, Num).
