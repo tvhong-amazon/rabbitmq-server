@@ -193,6 +193,7 @@ channel_stats(queue_stats, get, Id, Value) ->
 channel_stats(queue_stats, get_no_ack, Id, Value) ->
     %% Includes delete marker
     _ = ets:update_counter(channel_queue_metrics, Id, {3, Value}, {Id, 0, 0, 0, 0, 0, 0, 0, 0}),
+    rabbit_global_counters:channel_get(Value),
     ok;
 channel_stats(queue_stats, deliver, Id, Value) ->
     %% Includes delete marker
