@@ -16,8 +16,9 @@
          messages_routed/1,
          messages_acknowledged/1,
          channel_get_ack/1,
-         channel_get_empty/1
-        ]).
+         channel_get_empty/1,
+         channel_messages_delivered_ack/1
+       ]).
 
 
 -define(MESSAGES_RECEIVED, 1).
@@ -25,6 +26,7 @@
 -define(MESSAGES_ACKNOWLEDGED, 3).
 -define(CHANNEL_GET_ACK, 4).
 -define(CHANNEL_GET_EMPTY, 5).
+-define(CHANNEL_MESSAGES_DELIVERED_ACK, 6).
 
 -define(COUNTERS,
             [
@@ -47,6 +49,10 @@
                 {
                     channel_get_empty_total, ?CHANNEL_GET_EMPTY, counter,
                     "Total number of times basic.get operations fetched no message"
+                },
+                {
+                    channel_messages_delivered_ack_total, ?CHANNEL_MESSAGES_DELIVERED_ACK, counter,
+                    "Total number of messages delivered to consumers in manual acknowledgement mode"
                 }
             ]).
 
@@ -92,3 +98,6 @@ channel_get_ack(Num) ->
 
 channel_get_empty(Num) ->
     counters:add(persistent_term:get(?MODULE), ?CHANNEL_GET_EMPTY, Num).
+
+channel_messages_delivered_ack(Num) ->
+    counters:add(persistent_term:get(?MODULE), ?CHANNEL_MESSAGES_DELIVERED_ACK, Num).
