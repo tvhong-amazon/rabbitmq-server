@@ -74,7 +74,6 @@
     ]},
 
     {channel_queue_metrics, [
-        {2, undefined, channel_get_ack_total, counter, "Total number of messages fetched with basic.get in manual acknowledgement mode"},
         {3, undefined, channel_get_total, counter, "Total number of messages fetched with basic.get in automatic acknowledgement mode"},
         {4, undefined, channel_messages_delivered_ack_total, counter, "Total number of messages delivered to consumers in manual acknowledgement mode"},
         {5, undefined, channel_messages_delivered_total, counter, "Total number of messages delivered to consumers in automatic acknowledgement mode"},
@@ -104,10 +103,6 @@
         {2, undefined, connection_outgoing_packets_total, counter, "Total number of packets sent on a connection", send_cnt},
         {2, undefined, connection_pending_packets, gauge, "Number of packets waiting to be sent on a connection", send_pend},
         {2, undefined, connection_channels, gauge, "Channels on a connection", channels}
-    ]},
-
-    {channel_queue_exchange_metrics, [
-        {2, undefined, queue_messages_published_total, counter, "Total number of messages published to queues"}
     ]},
 
     {node_coarse_metrics, [

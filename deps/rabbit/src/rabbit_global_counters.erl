@@ -1,3 +1,10 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2021 VMware, Inc. or its affiliates.  All rights reserved.
+%%
+
 -module(rabbit_global_counters).
 -on_load(init/0).
 
@@ -7,13 +14,16 @@
          prometheus_format/0,
          messages_received/1,
          messages_routed/1,
-         messages_acknowledged/1
+         messages_acknowledged/1,
+         channel_get_ack/1
         ]).
 
 
 -define(MESSAGES_RECEIVED, 1).
 -define(MESSAGES_ROUTED, 2).
 -define(MESSAGES_ACKNOWLEDGED, 3).
+-define(GET_ACK, 4).
+
 -define(COUNTERS,
             [
                 {
@@ -21,16 +31,26 @@
                     "Total number of messages received from clients"
                 },
                 {
+                    messages_acknowledged_total, ?MESSAGES_ACKNOWLEDGED, counter,
+                    "Total number of message acknowledgements received from consumers"
+                },
+                {
                     messages_routed_total, ?MESSAGES_ROUTED, counter,
                     "Total number of messages routed to queues"
                 },
                 {
-                    messages_acknowledged, ?MESSAGES_ACKNOWLEDGED, counter,
-                    "Total number of message acknowledgements received from consumers"
+                    channel_get_ack_total, ?GET_ACK, counter,
+                    "Total number of messages fetched with basic.get in manual acknowledgement mode"
                 }
             ]).
 
 init() ->
+    %% Make this a test instead
+    case lists:sort([ID || {_, ID, _, _} <- ?COUNTERS]) == lists:seq(1, length(?COUNTERS)) of
+        false -> rabbit_log:critical("rabbit_global_counters indices are not a consequitive list of integers");
+        true -> ok
+    end,
+
     persistent_term:put(?MODULE,
                         counters:new(length(?COUNTERS), [write_concurrency])),
     ok.
@@ -45,16 +65,21 @@ overview() ->
       ?COUNTERS
      ).
 
-messages_received(Num) ->
-    counters:add(persistent_term:get(?MODULE), ?MESSAGES_RECEIVED, Num).
-
-messages_routed(Num) ->
-    counters:add(persistent_term:get(?MODULE), ?MESSAGES_ROUTED, Num).
-
-messages_acknowledged(Num) ->
-    counters:add(persistent_term:get(?MODULE), ?MESSAGES_ACKNOWLEDGED, Num).
-
 prometheus_format() ->
     Counters = persistent_term:get(?MODULE),
     [{Key, counters:get(Counters, Index), Type, Help} ||
      {Key, Index, Type, Help} <- ?COUNTERS].
+
+messages_received(Num) ->
+    counters:add(persistent_term:get(?MODULE), ?MESSAGES_RECEIVED, Num).
+
+% formerly known as queue_messages_published_total
+messages_routed(Num) ->
+    counters:add(persistent_term:get(?MODULE), ?MESSAGES_ROUTED, Num).
+
+%% doesn't work when consuming messages through the API
+messages_acknowledged(Num) ->
+    counters:add(persistent_term:get(?MODULE), ?MESSAGES_ACKNOWLEDGED, Num).
+
+channel_get_ack(Num) ->
+    counters:add(persistent_term:get(?MODULE), ?GET_ACK, Num).
