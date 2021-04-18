@@ -208,6 +208,7 @@ channel_stats(queue_stats, deliver_no_ack, Id, Value) ->
 channel_stats(queue_stats, redeliver, Id, Value) ->
     %% Includes delete marker
     _ = ets:update_counter(channel_queue_metrics, Id, {6, Value}, {Id, 0, 0, 0, 0, 0, 0, 0, 0}),
+    rabbit_global_counters:channel_messages_redelivered(Value),
     ok;
 channel_stats(queue_stats, ack, Id, Value) ->
     %% Includes delete marker
