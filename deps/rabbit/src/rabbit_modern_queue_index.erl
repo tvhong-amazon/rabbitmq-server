@@ -72,7 +72,18 @@
     %% full entry. Updates include deliver and ack.
     %% Used to determine if flushing only delivers/acks
     %% is enough to get the buffer to a comfortable size.
-    write_buffer_updates = 0,
+    write_buffer_updates = 0 :: non_neg_integer(),
+
+    %% Messages waiting for publisher confirms. The
+    %% publisher confirms will be sent when the message
+    %% has been synced to disk (as an entry or an ack).
+    %%
+    %% The index does not call file:sync/1 by default.
+    %% It only does when publisher confirms are used
+    %% and there are outstanding unconfirmed messages.
+    %% In that case the buffer is flushed to disk when
+    %% the queue requests a sync (after a timeout).
+    confirms = #{} :: #{seq_id() => rabbit_types:msg_id()},
 
     %% seq_id() of the next message to be read from disk.
     %% After the read_marker position there may be messages
@@ -120,21 +131,10 @@
     %%       per queue index instead of relying on file_handle_cache.
     fds = #{} :: #{non_neg_integer() => file:fd()},
 
-    %% These funs are specific to the rabbit_variable_queue
-    %% implementation. It expects us to call them when we
-    %% have done a sync to the file system. Because we
-    %% are never doing an explicit sync we cannot call
-    %% them then so we instead call them as soon as we
-    %% have written to the file (even if the data sits
-    %% in the file cache and not on disk for a while).
-    %%
-    %% @todo Perhaps it could be useful to have an option
-    %% that defines whether we do syncs to keep the same
-    %% behavior as before for people who need it. But the
-    %% default should be no manual syncs for performance
-    %% reasons.
-    on_sync :: on_sync_fun(),
-    on_sync_msg :: on_sync_fun()
+    %% This fun must be called when messages that expect
+    %% confirms have either an ack or their entry
+    %% written to disk and file:sync/1 has been called.
+    on_sync :: on_sync_fun()
 }).
 
 -type mqistate() :: #mqistate{}.
@@ -142,7 +142,7 @@
 
 %% Types copied from rabbit_queue_index.
 
--type on_sync_fun() :: fun ((gb_sets:set()) -> ok). %% @todo OK not sure what I should do about that at all.
+-type on_sync_fun() :: fun ((gb_sets:set()) -> ok).
 -type contains_predicate() :: fun ((rabbit_types:msg_id()) -> boolean()).
 -type shutdown_terms() :: list() | 'non_clean_shutdown'.
 
@@ -159,20 +159,21 @@ erase(#resource{ virtual_host = VHost } = Name) ->
 -spec init(rabbit_amqqueue:name(),
                  on_sync_fun(), on_sync_fun()) -> mqistate().
 
-init(#resource{ virtual_host = VHost } = Name, OnSyncFun, OnSyncMsgFun) ->
-    ?DEBUG("~0p ~0p ~0p", [Name, OnSyncFun, OnSyncMsgFun]),
+%% We do not embed messages and as a result never need the OnSyncMsgFun.
+
+init(#resource{ virtual_host = VHost } = Name, OnSyncFun, _OnSyncMsgFun) ->
+    ?DEBUG("~0p ~0p", [Name, OnSyncFun]),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = queue_dir(VHostDir, Name),
     false = rabbit_file:is_file(Dir), %% is_file == is file or dir
-    init1(Name, Dir, OnSyncFun, OnSyncMsgFun).
+    init1(Name, Dir, OnSyncFun).
 
-init1(Name, Dir, OnSyncFun, OnSyncMsgFun) ->
+init1(Name, Dir, OnSyncFun) ->
     ensure_queue_name_stub_file(Name, Dir),
     ensure_segment_file(new, #mqistate{
         queue_name = Name,
         dir = Dir,
-        on_sync = OnSyncFun,
-        on_sync_msg = OnSyncMsgFun
+        on_sync = OnSyncFun
     }).
 
 ensure_queue_name_stub_file(#resource{virtual_host = VHost, name = QName}, Dir) ->
@@ -227,11 +228,10 @@ ensure_segment_file(Reason, State = #mqistate{ write_marker = WriteMarker,
 
 reset_state(State = #mqistate{ queue_name     = Name,
                                dir            = Dir,
-                               on_sync        = OnSyncFun,
-                               on_sync_msg    = OnSyncMsgFun }) ->
+                               on_sync        = OnSyncFun }) ->
     ?DEBUG("~0p", [State]),
     delete_and_terminate(State),
-    init1(Name, Dir, OnSyncFun, OnSyncMsgFun).
+    init1(Name, Dir, OnSyncFun).
 
 -spec recover(rabbit_amqqueue:name(), shutdown_terms(), boolean(),
                     contains_predicate(),
@@ -240,11 +240,11 @@ reset_state(State = #mqistate{ queue_name     = Name,
                          'undefined' | non_neg_integer(), mqistate()}.
 
 recover(#resource{ virtual_host = VHost } = Name, Terms, MsgStoreRecovered,
-        ContainsCheckFun, OnSyncFun, OnSyncMsgFun) ->
-    ?DEBUG("~0p ~0p ~0p ~0p ~0p ~0p", [Name, Terms, MsgStoreRecovered, ContainsCheckFun, OnSyncFun, OnSyncMsgFun]),
+        ContainsCheckFun, OnSyncFun, _OnSyncMsgFun) ->
+    ?DEBUG("~0p ~0p ~0p ~0p ~0p", [Name, Terms, MsgStoreRecovered, ContainsCheckFun, OnSyncFun]),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = queue_dir(VHostDir, Name),
-    State0 = init1(Name, Dir, OnSyncFun, OnSyncMsgFun),
+    State0 = init1(Name, Dir, OnSyncFun),
     %% We first recover the oldest/newest segment numbers, either
     %% from the terms or from the file names on disk.
     {Oldest, Newest} = case Terms =/= non_clean_shutdown of
@@ -315,7 +315,7 @@ terminate(VHost, Terms, State = #mqistate { dir = Dir,
     _ = maps:map(fun(_, Fd) ->
         ok = file:sync(Fd),
         ok = file:close(Fd)
-    end, undefined, OpenFds),
+    end, OpenFds),
     %% Write recovery terms for faster recovery.
     rabbit_recovery_terms:store(VHost, filename:basename(Dir),
                                 [{mqi_segments, {Oldest, Newest}} | Terms]),
@@ -329,7 +329,7 @@ delete_and_terminate(State = #mqistate { dir = Dir,
     %% Close all FDs.
     _ = maps:map(fun(_, Fd) ->
         ok = file:close(Fd)
-    end, undefined, OpenFds),
+    end, OpenFds),
     %% Erase the data on disk.
     ok = erase_index_dir(Dir),
     State#mqistate{ fds = #{} }.
@@ -337,6 +337,9 @@ delete_and_terminate(State = #mqistate { dir = Dir,
 -spec publish(rabbit_types:msg_id(), seq_id(),
                     rabbit_types:message_properties(), boolean(), boolean(),
                     non_neg_integer(), State) -> State when State::mqistate().
+
+%% @todo Because we always persist to the msg_store, the MsgOrId argument
+%%       here is always a binary, never a record.
 
 publish(MsgOrId, SeqId, Props, IsPersistent, _IsDelivered, TargetRamCount,
         State0 = #mqistate { write_marker = WriteMarker,
@@ -390,18 +393,30 @@ publish(MsgOrId, SeqId, Props, IsPersistent, IsDelivered, TargetRamCount,
     SegmentEntryCount = segment_entry_count(),
     ThisSegment = WriteMarker div SegmentEntryCount,
     NextSegment = NextWriteMarker div SegmentEntryCount,
-    State = case ThisSegment =:= NextSegment of
+    State3 = case ThisSegment =:= NextSegment of
         true -> State2;
         false -> ensure_segment_file(new, State2)
     end,
+    %% When publisher confirms have been requested for this
+    %% message we mark the message as unconfirmed.
+    State = maybe_mark_unconfirmed(MsgOrId, SeqId, Props, State3),
     maybe_flush_buffer(State).
+
+maybe_mark_unconfirmed(MsgId, SeqId, #message_properties{ needs_confirming = true },
+        State = #mqistate { confirms = Confirms }) ->
+    State#mqistate{ confirms = Confirms#{SeqId => MsgId} };
+maybe_mark_unconfirmed(_, _, _, State) ->
+    State.
 
 %% @todo Perhaps make the two limits configurable.
 maybe_flush_buffer(State = #mqistate { write_buffer = WriteBuffer })
         when map_size(WriteBuffer) < 2000 ->
     State;
-maybe_flush_buffer(State0 = #mqistate { write_buffer = WriteBuffer0,
-                                        write_buffer_updates = NumUpdates }) ->
+maybe_flush_buffer(State) ->
+    flush_buffer(State).
+
+flush_buffer(State0 = #mqistate { write_buffer = WriteBuffer0,
+                                  write_buffer_updates = NumUpdates }) ->
     SegmentEntryCount = segment_entry_count(),
     %% First we prepare the writes sorted by segment.
     PartialFlush = NumUpdates >= 100,
@@ -414,8 +429,8 @@ maybe_flush_buffer(State0 = #mqistate { write_buffer = WriteBuffer0,
             %% @todo Use a define for the offset. Use a define for the values.
             {acc_write(SeqId, SegmentEntryCount, <<1>>, +1, WritesAcc),
              BufferAcc};
-        %% When there are 100+ deliver | ack updates, we only write
-        %% those and get the buffer back to a comfortable level.
+        %% When there are less than 100 entries, we only write updates
+        %% (deliver | ack) and get the buffer back to a comfortable level.
         (SeqId, Entry, {WritesAcc, BufferAcc}) when PartialFlush ->
             {WritesAcc,
              BufferAcc#{SeqId => Entry}};
@@ -876,18 +891,36 @@ flush_pre_publish_cache(TargetRamCount, State) ->
 
 -spec sync(State) -> State when State::mqistate().
 
-sync(State) ->
-    ?DEBUG("~0p", [State]),
-    State.
+%% @todo Move this elsewhere.
+sync(State0 = #mqistate{ confirms = Confirms,
+                         fds = OpenFds,
+                         on_sync = OnSyncFun }) ->
+    ?DEBUG("~0p", [State0]),
+    State = flush_buffer(State0),
+    %% Call file:sync/1 on all open FDs. Some of them might not have
+    %% writes but for the time being we don't discriminate.
+    _ = maps:fold(fun(_, Fd, _) ->
+        ok = file:sync(Fd)
+    end, undefined, OpenFds),
+    %% Notify syncs.
+    Set = gb_sets:from_list(maps:values(Confirms)),
+    OnSyncFun(Set),
+    %% Reset confirms.
+    State#mqistate{ confirms = #{} }.
 
 -spec needs_sync(mqistate()) -> 'false'.
 
-needs_sync(State) ->
+%% @todo Move this elsewhere.
+needs_sync(State = #mqistate{ confirms = Confirms }) ->
     ?DEBUG("~0p", [State]),
-    false.
+    case Confirms =:= #{} of
+        true -> false;
+        false -> confirms
+    end.
 
 -spec flush(State) -> State when State::mqistate().
 
+%% @todo We might need this as well? Lower memory usage before hibernate.
 flush(State) ->
     ?DEBUG("~0p", [State]),
     State.
