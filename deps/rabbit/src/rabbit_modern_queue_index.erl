@@ -117,14 +117,6 @@
     %% messages before them.
     acks = [] :: [seq_id()],
 
-    %% Oldest segment file number with un-acked messages.
-    %% Roughly where we are currently reading messages from.
-    oldest_segment = 0 :: non_neg_integer(),
-
-    %% Newest segment file number with un-acked messages.
-    %% Where we are writing newly published messages to.
-    newest_segment = 0 :: non_neg_integer(),
-
     %% File descriptors.
     %% @todo The current implementation does not limit the number of FDs open.
     %%       This is most likely not desirable... Perhaps we can have a limit
@@ -186,8 +178,15 @@ ensure_segment_file(Reason, State = #mqistate{ write_marker = WriteMarker,
                                                fds = OpenFds }) ->
     SegmentEntryCount = segment_entry_count(),
     Segment = WriteMarker div SegmentEntryCount,
-    %% We only use 'read' here so the file doesn't get truncated.
-    {ok, Fd} = file:open(segment_file(Segment, State), [read, write, raw, binary]),
+    %% The file might already be opened during recovery. Don't open it again.
+    Fd = case {Reason, OpenFds} of
+        {recover, #{Segment := Fd0}} ->
+            Fd0;
+        _ ->
+            false = maps:is_key(Segment, OpenFds), %% assert
+            {ok, Fd0} = file:open(segment_file(Segment, State), [read, write, raw, binary]),
+            Fd0
+    end,
     %% When we are recovering from a shutdown we may need to check
     %% whether the file already has content. If it does, we do
     %% nothing. Otherwise, as well as in the normal case, we
@@ -247,54 +246,151 @@ recover(#resource{ virtual_host = VHost } = Name, Terms, MsgStoreRecovered,
     State0 = init1(Name, Dir, OnSyncFun),
     %% We first recover the oldest/newest segment numbers, either
     %% from the terms or from the file names on disk.
-    {Oldest, Newest} = case Terms =/= non_clean_shutdown of
+    State1 = case Terms =/= non_clean_shutdown of
         true ->
-            %% @todo Both ack_marker and acks should also be stored in terms.
-            %% @todo Maybe we can also keep a read_marker as a small optimization as well.
-            %% In that case the read_marker would be min(read_marker, min(in_transit)).
-            proplists:get_value(mqi_segments, Terms, {0, 0});
+            {WriteMarker0, AckMarker0, Acks0} = proplists:get_value(mqi_state, Terms, {0, undefined, []}),
+            State0#mqistate{ write_marker = WriteMarker0,
+                             ack_marker = AckMarker0,
+                             acks = Acks0 };
         false ->
             %% @todo We also need to figure out what the write_marker is!!
             %%       On the other hand the ack_marker can be set to 'undefined'
             %%       when (ReadMarker = 0) or (ReadMarker - 1) otherwise.
-            recover_segments(Dir)
+            recover_segments(State0)
     end,
-    %% We set the read marker to the first message in the oldest
-    %% segment. The acked messages will be skipped automatically.
-    %% @todo Do this.
-    %% @todo Only do this when we have a dirty init.
-    State1 = State0#mqistate{ oldest_segment = Oldest,
-                              newest_segment = Newest },
+    %% We set the read marker to the first message after the ack marker.
+    State2 = case State1 of
+        #mqistate{ ack_marker = undefined } -> State1; %% Default is 0.
+        #mqistate{ ack_marker = AckMarker } -> State1#mqistate{ read_marker = AckMarker + 1 }
+    end,
     %% If the message store had to recover, we go through
     %% messages in the segments to make sure we are synced
     %% with the messages in the store.
-    {Count, Bytes, State2} = case MsgStoreRecovered of
+    {Count, Bytes, State} = case MsgStoreRecovered of
         true ->
-            recover_sync_with_msg_store(ContainsCheckFun, State1);
+            recover_sync_with_msg_store(ContainsCheckFun, State2);
         false ->
-            {undefined, undefined, State1}
+            {undefined, undefined, State2}
     end,
-    %% We set the read marker to the first message in
-    %% the oldest segment. The first read/2 call will then skip
-    %% to the first un-acked message automatically. We do not
-    %% need to worry about acked and unacked messages being
-    %% interspersed because of this skip mechanism.
-    State = State2#mqistate{ read_marker = Oldest * segment_entry_count() },
     %% We can now ensure the current segment file is in a good state and return.
     {Count, Bytes, ensure_segment_file(recover, State)}.
 
-%% This function will not play nice if there are non-integers
-%% file names with the same extension as segment files.
-
-recover_segments(Dir) ->
-    %% @todo We also need to look inside the files to recover ack_marker and acks.
-    Nums = lists:sort([
+recover_segments(State0 = #mqistate { dir = Dir }) ->
+    %% Figure out which files exist. Sort them in segment order.
+    SegmentFiles = rabbit_file:wildcard(".*\\" ++ ?SEGMENT_EXTENSION, Dir),
+    Segments = lists:sort([
         list_to_integer(filename:basename(F, ?SEGMENT_EXTENSION))
-    || F <- rabbit_file:wildcard(".*\\" ++ ?SEGMENT_EXTENSION, Dir)]),
-    case Nums of
-        [] -> {0, 0};
-        [N] -> {N, N};
-        [Oldest|Tail] -> {Oldest, hd(lists:reverse(Tail))}
+    || F <- SegmentFiles]),
+    %% @todo We may want to figure out if some files are missing (there are holes)
+    %%       and if so, we want to create new fully acked files and add those
+    %%       messages to the acks list.
+    %%
+    %% @todo We may want to check that the file sizes are correct before attempting
+    %%       to parse them, and to correct the file sizes. Correcting file sizes
+    %%       may create holes within segment files though if we only file:allocate.
+    case Segments of
+        %% No segments found. Keep default values.
+        [] ->
+            State0;
+        %% Look for markers and acks in the files we've found.
+        [FirstSegment|Tail] ->
+            {Fd, State} = get_fd_for_segment(FirstSegment, State0),
+            SegmentEntryCount = segment_entry_count(),
+            FirstSeqId = FirstSegment * SegmentEntryCount,
+            recover_ack_marker(State, Fd, FirstSegment, SegmentEntryCount, FirstSeqId, Tail)
+    end.
+
+recover_ack_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments) ->
+    case locate(SeqId, SegmentEntryCount) of
+        %% The SeqId is in the current segment file.
+        {FdSegment, Offset} ->
+            case file:pread(Fd, Offset, 1) of
+                %% We found an ack, continue.
+                {ok, <<2>>} ->
+                    recover_ack_marker(State,
+                                       Fd, FdSegment, SegmentEntryCount,
+                                       SeqId + 1, Segments);
+                %% We found a non-ack entry! The previous SeqId is our ack_marker.
+                %% We now need to figure out where the write_marker ends.
+                {ok, <<1>>} ->
+                    AckMarker = case SeqId of
+                        0 -> undefined;
+                        _ -> SeqId - 1
+                    end,
+                    recover_write_marker(State#mqistate{ ack_marker = AckMarker },
+                                         Fd, FdSegment, SegmentEntryCount,
+                                         SeqId + 1, Segments, []);
+                %% We found a non-entry. Everything was acked.
+                %%
+                %% @todo We may want to find out whether this is a hole in the file
+                %%       or the real end of the segments. If this is a hole, we could
+                %%       repair it automatically.
+                {ok, <<0>>} ->
+                    AckMarker = case SeqId of
+                        0 -> undefined;
+                        _ -> SeqId - 1
+                    end,
+                    State#mqistate{ write_marker = SeqId,
+                                    ack_marker = AckMarker }
+            end;
+        %% The SeqId is in another segment file. The current file has been
+        %% fully acked. Delete this file and open the next segment file if any.
+        %% If there are no more files this means that everything was acked and
+        %% that we can start again with default values.
+        {_, _} ->
+            EofState = delete_segment(FdSegment, State),
+            case Segments of
+                [] ->
+                    EofState;
+                [NextSegment|Tail] ->
+                    {NextFd, NextState} = get_fd_for_segment(NextSegment, EofState),
+                    NextSeqId = NextSegment * SegmentEntryCount, %% Might not be =:= SeqId if files are not contiguous.
+                    recover_ack_marker(NextState,
+                                       NextFd, NextSegment, SegmentEntryCount,
+                                       NextSeqId, Tail)
+            end
+    end.
+
+recover_write_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments, Acks) ->
+    case locate(SeqId, SegmentEntryCount) of
+        %% The SeqId is in the current segment file.
+        {FdSegment, Offset} ->
+            case file:pread(Fd, Offset, 1) of
+                %% We found an ack, add it to the acks list.
+                {ok, <<2>>} ->
+                    recover_write_marker(State,
+                        Fd, FdSegment, SegmentEntryCount,
+                        SeqId + 1, Segments, [SeqId|Acks]);
+                %% We found a non-ack entry, continue.
+                {ok, <<1>>} ->
+                    recover_write_marker(State,
+                        Fd, FdSegment, SegmentEntryCount,
+                        SeqId + 1, Segments, Acks);
+                %% We found a non-entry. The SeqId is our write_marker.
+                %%
+                %% @todo We may want to find out whether this is a hole in the file
+                %%       or the real end of the segments. If this is a hole, we could
+                %%       repair it automatically.
+                {ok, <<0>>} when Segments =:= [] ->
+                    State#mqistate{ write_marker = SeqId,
+                                    acks = Acks }
+            end;
+        %% The SeqId is in another segment file.
+        {_, _} ->
+            case Segments of
+                %% This was the last segment file. The SeqId is our
+                %% write_marker.
+                [] ->
+                    State#mqistate{ write_marker = SeqId,
+                                    acks = Acks };
+                %% Continue reading.
+                [NextSegment|Tail] ->
+                    {NextFd, NextState} = get_fd_for_segment(NextSegment, State),
+                    NextSeqId = NextSegment * SegmentEntryCount, %% Might not be =:= SeqId if files are not contiguous.
+                    recover_write_marker(NextState,
+                        NextFd, NextSegment, SegmentEntryCount,
+                        NextSeqId, Tail, Acks)
+            end
     end.
 
 %% We mark messages as acked if they are no longer in the message
@@ -306,19 +402,23 @@ recover_sync_with_msg_store(_ContainsCheckFun, _State) ->
 
 -spec terminate(rabbit_types:vhost(), [any()], State) -> State when State::mqistate().
 
-terminate(VHost, Terms, State = #mqistate { dir = Dir,
-                                            fds = OpenFds,
-                                            oldest_segment = Oldest,
-                                            newest_segment = Newest }) ->
-    ?DEBUG("~0p ~0p ~0p", [VHost, Terms, State]),
+terminate(VHost, Terms, State0 = #mqistate { dir = Dir,
+                                             write_marker = WriteMarker,
+                                             ack_marker = AckMarker,
+                                             acks = Acks,
+                                             fds = OpenFds }) ->
+    ?DEBUG("~0p ~0p ~0p", [VHost, Terms, State0]),
+    %% Flush the buffer.
+    State = flush_buffer(State0, full),
     %% Fsync and close all FDs.
     _ = maps:map(fun(_, Fd) ->
         ok = file:sync(Fd),
         ok = file:close(Fd)
     end, OpenFds),
     %% Write recovery terms for faster recovery.
+    Term = {WriteMarker, AckMarker, Acks},
     rabbit_recovery_terms:store(VHost, filename:basename(Dir),
-                                [{mqi_segments, {Oldest, Newest}} | Terms]),
+                                [{mqi_state, Term} | Terms]),
     State#mqistate{ fds = #{} }.
 
 -spec delete_and_terminate(State) -> State when State::mqistate().
@@ -412,26 +512,28 @@ maybe_mark_unconfirmed(_, _, _, State) ->
 maybe_flush_buffer(State = #mqistate { write_buffer = WriteBuffer })
         when map_size(WriteBuffer) < 2000 ->
     State;
-maybe_flush_buffer(State) ->
-    flush_buffer(State).
+maybe_flush_buffer(State = #mqistate { write_buffer_updates = NumUpdates }) ->
+    FlushType = case NumUpdates >= 100 of
+        true -> updates;
+        false -> full
+    end,
+    flush_buffer(State, FlushType).
 
-flush_buffer(State0 = #mqistate { write_buffer = WriteBuffer0,
-                                  write_buffer_updates = NumUpdates }) ->
+%% When there are less than 100 entries, we only write updates
+%% (deliver | ack) and get the buffer back to a comfortable level.
+
+flush_buffer(State0 = #mqistate { write_buffer = WriteBuffer0 },
+             FlushType) ->
     SegmentEntryCount = segment_entry_count(),
     %% First we prepare the writes sorted by segment.
-    PartialFlush = NumUpdates >= 100,
     {Writes, WriteBuffer} = maps:fold(fun
         (SeqId, ack, {WritesAcc, BufferAcc}) ->
-            %% @todo Use a define for the offset. Use a define for the values.
             {acc_write(SeqId, SegmentEntryCount, <<2>>, +0, WritesAcc),
              BufferAcc};
         (SeqId, deliver, {WritesAcc, BufferAcc}) ->
-            %% @todo Use a define for the offset. Use a define for the values.
             {acc_write(SeqId, SegmentEntryCount, <<1>>, +1, WritesAcc),
              BufferAcc};
-        %% When there are less than 100 entries, we only write updates
-        %% (deliver | ack) and get the buffer back to a comfortable level.
-        (SeqId, Entry, {WritesAcc, BufferAcc}) when PartialFlush ->
+        (SeqId, Entry, {WritesAcc, BufferAcc}) when FlushType =:= updates ->
             {WritesAcc,
              BufferAcc#{SeqId => Entry}};
         %% Otherwise we write the entire buffer.
@@ -450,10 +552,9 @@ flush_buffer(State0 = #mqistate { write_buffer = WriteBuffer0,
                     write_buffer_updates = 0 }.
 
 acc_write(SeqId, SegmentEntryCount, Bytes, EntryOffset, WritesAcc) ->
-    Segment = SeqId div SegmentEntryCount,
+    {Segment, Offset} = locate(SeqId, SegmentEntryCount),
     LocBytesAcc = maps:get(Segment, WritesAcc, []),
-    Offset = ?HEADER_SIZE + (SeqId rem SegmentEntryCount) * ?ENTRY_SIZE + EntryOffset,
-    WritesAcc#{Segment => [{Offset, Bytes}|LocBytesAcc]}.
+    WritesAcc#{Segment => [{Offset + EntryOffset, Bytes}|LocBytesAcc]}.
 
 build_entry({Id, _SeqId, Props, IsPersistent, IsDelivered}) ->
     IsDeliveredFlag = case IsDelivered of
@@ -469,7 +570,7 @@ build_entry({Id, _SeqId, Props, IsPersistent, IsDelivered}) ->
         undefined -> 0;
         _ -> Expiry0
     end,
-    << 1:8,                   %% ACK. 0 = no entry, 1 = entry exists, 2 = entry acked
+    << 1:8,                   %% Status. 0 = no entry, 1 = entry exists, 2 = entry acked
        IsDeliveredFlag:8,     %% Deliver.
        Flags:8,               %% IsPersistent flag (least significant bit).
        0:8,                   %% Reserved. Makes entries 32B in size to match page alignment on disk.
@@ -807,8 +908,7 @@ read_from_disk(SeqIdsToRead0, State0, Acc0) ->
 
 get_fd(SeqId, State = #mqistate{ fds = OpenFds }) ->
     SegmentEntryCount = segment_entry_count(),
-    Segment = SeqId div SegmentEntryCount,
-    Offset = ?HEADER_SIZE + (SeqId rem SegmentEntryCount) * ?ENTRY_SIZE,
+    {Segment, Offset} = locate(SeqId, SegmentEntryCount),
     case OpenFds of
         #{ Segment := Fd } ->
             {Fd, Offset, State};
@@ -816,6 +916,11 @@ get_fd(SeqId, State = #mqistate{ fds = OpenFds }) ->
             {ok, Fd} = file:open(segment_file(Segment, State), [read, write, raw, binary]),
             {Fd, Offset, State#mqistate{ fds = OpenFds#{ Segment => Fd }}}
     end.
+
+locate(SeqId, SegmentEntryCount) ->
+    Segment = SeqId div SegmentEntryCount,
+    Offset = ?HEADER_SIZE + (SeqId rem SegmentEntryCount) * ?ENTRY_SIZE,
+    {Segment, Offset}.
 
 %% When recovering from a dirty shutdown, we may end up reading entries that
 %% have already been acked. We do not add them to the Acc in that case, and
@@ -896,7 +1001,7 @@ sync(State0 = #mqistate{ confirms = Confirms,
                          fds = OpenFds,
                          on_sync = OnSyncFun }) ->
     ?DEBUG("~0p", [State0]),
-    State = flush_buffer(State0),
+    State = flush_buffer(State0, full),
     %% Call file:sync/1 on all open FDs. Some of them might not have
     %% writes but for the time being we don't discriminate.
     _ = maps:fold(fun(_, Fd, _) ->
@@ -933,13 +1038,10 @@ flush(State) ->
                        {non_neg_integer(), non_neg_integer(), State}
                        when State::mqistate().
 
-%% @todo Implement so that we don't start at the second segment...
-%% @todo Second one must be write_marker.
-bounds(State) -> % = #mqistate{oldest_segment=Oldest, newest_segment=Newest}) ->
+bounds(State = #mqistate{ write_marker = Newest,
+                          read_marker = Oldest }) ->
     ?DEBUG("~0p", [State]),
-    {0, 0, State}.
-%    SegmentEntryCount = segment_entry_count(),
-%    {Oldest * SegmentEntryCount, (1 + Newest) * SegmentEntryCount, State}.
+    {Oldest, Newest, State}.
 
 %% The next_segment_boundary/1 function is used internally when
 %% reading. It should not be called from rabbit_variable_queue.
