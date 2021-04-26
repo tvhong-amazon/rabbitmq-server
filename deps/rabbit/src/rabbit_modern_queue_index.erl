@@ -238,56 +238,63 @@ reset_state(State = #mqistate{ queue_name     = Name,
                         {'undefined' | non_neg_integer(),
                          'undefined' | non_neg_integer(), mqistate()}.
 
-recover(#resource{ virtual_host = VHost } = Name, Terms, MsgStoreRecovered,
+-define(RECOVER_COUNT, 1).
+-define(RECOVER_BYTES, 2).
+
+recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
         ContainsCheckFun, OnSyncFun, _OnSyncMsgFun) ->
-    ?DEBUG("~0p ~0p ~0p ~0p ~0p", [Name, Terms, MsgStoreRecovered, ContainsCheckFun, OnSyncFun]),
+    ?DEBUG("~0p ~0p ~0p ~0p ~0p", [Name, Terms, IsMsgStoreClean, ContainsCheckFun, OnSyncFun]),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = queue_dir(VHostDir, Name),
     State0 = init1(Name, Dir, OnSyncFun),
-    %% We first recover the oldest/newest segment numbers, either
-    %% from the terms or from the file names on disk.
-    State1 = case Terms =/= non_clean_shutdown of
+    %% We go over all segments if either the index or the
+    %% message store has/had to recover. Otherwise we just
+    %% take our state from Terms.
+    IsIndexClean = Terms =/= non_clean_shutdown,
+    {Count, Bytes, State2} = case IsIndexClean andalso IsMsgStoreClean of
         true ->
             {WriteMarker0, AckMarker0, Acks0} = proplists:get_value(mqi_state, Terms, {0, undefined, []}),
-            State0#mqistate{ write_marker = WriteMarker0,
-                             ack_marker = AckMarker0,
-                             acks = Acks0 };
+            %% The queue has stored the count/bytes values inside
+            %% Terms so we don't need to provide them again.
+            %% However I can see this being a problem if
+            %% there's been corruption on the disk. But
+            %% a better fix would be to rework the way
+            %% rabbit_variable_queue works.
+            {undefined,
+             undefined,
+             State0#mqistate{ write_marker = WriteMarker0,
+                              ack_marker = AckMarker0,
+                              acks = Acks0 }};
         false ->
-            %% @todo We also need to figure out what the write_marker is!!
-            %%       On the other hand the ack_marker can be set to 'undefined'
-            %%       when (ReadMarker = 0) or (ReadMarker - 1) otherwise.
-            recover_segments(State0)
+            CountersRef = counters:new(2, []),
+            State1 = recover_segments(State0, ContainsCheckFun, CountersRef),
+            {counters:get(CountersRef, ?RECOVER_COUNT),
+             counters:get(CountersRef, ?RECOVER_BYTES),
+             State1}
     end,
+    %% We double check the ack marker because when the message store has
+    %% recovered we might have marked additional messages as acked as
+    %% part of the recovery process.
+    State3 = recover_maybe_advance_ack_marker(State2),
     %% We set the read marker to the first message after the ack marker.
-    State2 = case State1 of
-        #mqistate{ ack_marker = undefined } -> State1; %% Default is 0.
-        #mqistate{ ack_marker = AckMarker } -> State1#mqistate{ read_marker = AckMarker + 1 }
-    end,
-    %% If the message store had to recover, we go through
-    %% messages in the segments to make sure we are synced
-    %% with the messages in the store.
-    {Count, Bytes, State} = case MsgStoreRecovered of
-        true ->
-            recover_sync_with_msg_store(ContainsCheckFun, State2);
-        false ->
-            {undefined, undefined, State2}
-    end,
+    State = recover_read_marker(State3),
     %% We can now ensure the current segment file is in a good state and return.
     {Count, Bytes, ensure_segment_file(recover, State)}.
 
-recover_segments(State0 = #mqistate { dir = Dir }) ->
+recover_segments(State0 = #mqistate { dir = Dir }, ContainsCheckFun, CountersRef) ->
     %% Figure out which files exist. Sort them in segment order.
     SegmentFiles = rabbit_file:wildcard(".*\\" ++ ?SEGMENT_EXTENSION, Dir),
     Segments = lists:sort([
         list_to_integer(filename:basename(F, ?SEGMENT_EXTENSION))
     || F <- SegmentFiles]),
-    %% @todo We may want to figure out if some files are missing (there are holes)
+    %% @todo We want to figure out if some files are missing (there are holes)
     %%       and if so, we want to create new fully acked files and add those
     %%       messages to the acks list.
     %%
     %% @todo We may want to check that the file sizes are correct before attempting
     %%       to parse them, and to correct the file sizes. Correcting file sizes
     %%       may create holes within segment files though if we only file:allocate.
+    %%       Not sure what should be done about that one.
     case Segments of
         %% No segments found. Keep default values.
         [] ->
@@ -297,17 +304,20 @@ recover_segments(State0 = #mqistate { dir = Dir }) ->
             {Fd, State} = get_fd_for_segment(FirstSegment, State0),
             SegmentEntryCount = segment_entry_count(),
             FirstSeqId = FirstSegment * SegmentEntryCount,
-            recover_ack_marker(State, Fd, FirstSegment, SegmentEntryCount, FirstSeqId, Tail)
+            recover_ack_marker(State, ContainsCheckFun, CountersRef,
+                               Fd, FirstSegment, SegmentEntryCount,
+                               FirstSeqId, Tail)
     end.
 
-recover_ack_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments) ->
+recover_ack_marker(State, ContainsCheckFun, CountersRef,
+                   Fd, FdSegment, SegmentEntryCount, SeqId, Segments) ->
     case locate(SeqId, SegmentEntryCount) of
         %% The SeqId is in the current segment file.
         {FdSegment, Offset} ->
             case file:pread(Fd, Offset, 1) of
                 %% We found an ack, continue.
                 {ok, <<2>>} ->
-                    recover_ack_marker(State,
+                    recover_ack_marker(State, ContainsCheckFun, CountersRef,
                                        Fd, FdSegment, SegmentEntryCount,
                                        SeqId + 1, Segments);
                 %% We found a non-ack entry! The previous SeqId is our ack_marker.
@@ -318,6 +328,7 @@ recover_ack_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments) ->
                         _ -> SeqId - 1
                     end,
                     recover_write_marker(State#mqistate{ ack_marker = AckMarker },
+                                         ContainsCheckFun, CountersRef,
                                          Fd, FdSegment, SegmentEntryCount,
                                          SeqId + 1, Segments, []);
                 %% We found a non-entry. Everything was acked.
@@ -345,33 +356,53 @@ recover_ack_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments) ->
                 [NextSegment|Tail] ->
                     {NextFd, NextState} = get_fd_for_segment(NextSegment, EofState),
                     NextSeqId = NextSegment * SegmentEntryCount, %% Might not be =:= SeqId if files are not contiguous.
-                    recover_ack_marker(NextState,
+                    recover_ack_marker(NextState, ContainsCheckFun, CountersRef,
                                        NextFd, NextSegment, SegmentEntryCount,
                                        NextSeqId, Tail)
             end
     end.
 
-recover_write_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments, Acks) ->
+%% This function does two things: it recovers the write_marker,
+%% and it ensures that non-acked entries found have a corresponding
+%% message in the message store.
+
+recover_write_marker(State, ContainsCheckFun, CountersRef,
+                     Fd, FdSegment, SegmentEntryCount, SeqId, Segments, Acks) ->
     case locate(SeqId, SegmentEntryCount) of
         %% The SeqId is in the current segment file.
         {FdSegment, Offset} ->
-            case file:pread(Fd, Offset, 1) of
+            case file:pread(Fd, Offset, 24) of
                 %% We found an ack, add it to the acks list.
-                {ok, <<2>>} ->
-                    recover_write_marker(State,
+                {ok, <<2,_/bits>>} ->
+                    recover_write_marker(State, ContainsCheckFun, CountersRef,
                         Fd, FdSegment, SegmentEntryCount,
                         SeqId + 1, Segments, [SeqId|Acks]);
-                %% We found a non-ack entry, continue.
-                {ok, <<1>>} ->
-                    recover_write_marker(State,
+                %% We found a non-ack entry. Check that the corresponding message
+                %% exists in the message store. If not, mark this message as acked.
+                %%
+                %% @todo rabbit_queue_index marks all messages as delivered
+                %%       when the shutdown was not clean. Should we do the same?
+                {ok, <<1,_:24,Id:16/binary,Size:32/unsigned>>} ->
+                    NextAcks = case ContainsCheckFun(Id) of
+                        %% Message is in the store.
+                        true ->
+                            counters:add(CountersRef, ?RECOVER_COUNT, 1),
+                            counters:add(CountersRef, ?RECOVER_BYTES, Size),
+                            Acks;
+                        %% Message is not in the store. Mark it as acked.
+                        false ->
+                            file:pwrite(Fd, Offset, <<2>>),
+                            [SeqId|Acks]
+                    end,
+                    recover_write_marker(State, ContainsCheckFun, CountersRef,
                         Fd, FdSegment, SegmentEntryCount,
-                        SeqId + 1, Segments, Acks);
+                        SeqId + 1, Segments, NextAcks);
                 %% We found a non-entry. The SeqId is our write_marker.
                 %%
-                %% @todo We may want to find out whether this is a hole in the file
+                %% @todo We also want to find out whether this is a hole in the file
                 %%       or the real end of the segments. If this is a hole, we could
                 %%       repair it automatically.
-                {ok, <<0>>} when Segments =:= [] ->
+                {ok, <<0,_/bits>>} when Segments =:= [] ->
                     State#mqistate{ write_marker = SeqId,
                                     acks = Acks }
             end;
@@ -387,18 +418,37 @@ recover_write_marker(State, Fd, FdSegment, SegmentEntryCount, SeqId, Segments, A
                 [NextSegment|Tail] ->
                     {NextFd, NextState} = get_fd_for_segment(NextSegment, State),
                     NextSeqId = NextSegment * SegmentEntryCount, %% Might not be =:= SeqId if files are not contiguous.
-                    recover_write_marker(NextState,
+                    recover_write_marker(NextState, ContainsCheckFun, CountersRef,
                         NextFd, NextSegment, SegmentEntryCount,
                         NextSeqId, Tail, Acks)
             end
     end.
 
-%% We mark messages as acked if they are no longer in the message
-%% store. This does not necessarily mean that the message was
-%% sent to a consumer.
+recover_maybe_advance_ack_marker(State = #mqistate{ ack_marker = AckMarker0,
+                                                    acks = Acks0 }) ->
+    NextAckMarker = case AckMarker0 of
+        undefined -> 0;
+        _ -> AckMarker0 + 1
+    end,
+    case lists:member(NextAckMarker, Acks0) of
+        %% The ack_marker must be advanced because we found
+        %% the next seq_id() in the acks list.
+        true ->
+            AckMarker = highest_continuous_seq_id(Acks0),
+            Acks = lists:dropwhile(
+                fun(AckSeqId) -> AckSeqId =< AckMarker end,
+                Acks0),
+            State#mqistate{ ack_marker = AckMarker,
+                            acks = Acks };
+        %% The ack_marker is correct.
+        false ->
+            State
+    end.
 
-recover_sync_with_msg_store(_ContainsCheckFun, _State) ->
-    todo.
+recover_read_marker(State = #mqistate{ ack_marker = undefined }) ->
+    State; %% Default read_marker is 0.
+recover_read_marker(State = #mqistate{ ack_marker = AckMarker }) ->
+    State#mqistate{ read_marker = AckMarker + 1 }.
 
 -spec terminate(rabbit_types:vhost(), [any()], State) -> State when State::mqistate().
 
