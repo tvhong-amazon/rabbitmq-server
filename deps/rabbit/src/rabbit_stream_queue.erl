@@ -45,13 +45,17 @@
          delete_replica/3]).
 -export([format_osiris_event/2]).
 -export([update_stream_conf/2]).
+-export([readers/1]).
+
+-export([status/2,
+         tracking_status/2]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("amqqueue.hrl").
 
 -define(INFO_KEYS, [name, durable, auto_delete, arguments, leader, members, online, state,
                     messages, messages_ready, messages_unacknowledged, committed_offset,
-                    policy, operator_policy, effective_policy_definition, type]).
+                    policy, operator_policy, effective_policy_definition, type, memory]).
 
 -type appender_seq() :: non_neg_integer().
 
@@ -426,6 +430,21 @@ i(leader, Q) when ?is_amqqueue(Q) ->
 i(members, Q) when ?is_amqqueue(Q) ->
     #{nodes := Nodes} = amqqueue:get_type_state(Q),
     Nodes;
+i(memory, Q) when ?is_amqqueue(Q) ->
+    %% Return writer memory. It's not the full memory usage (we also have replica readers on
+    %% the writer node), but might be good enough
+    case amqqueue:get_pid(Q) of
+        none ->
+            0;
+        Pid ->
+            try
+                {memory, M} = process_info(Pid, memory),
+                M
+            catch
+                error:badarg ->
+                    0
+            end
+    end;
 i(online, Q) ->
     #{name := StreamId} = amqqueue:get_type_state(Q),
     case rabbit_stream_coordinator:members(StreamId) of
@@ -487,10 +506,114 @@ i(effective_policy_definition, Q) ->
         undefined -> [];
         Def       -> Def
     end;
+i(readers, Q) ->
+    QName = amqqueue:get_name(Q),
+    Conf = amqqueue:get_type_state(Q),
+    Nodes = [maps:get(leader_node, Conf) | maps:get(replica_nodes, Conf)],
+    {Data, _} = rpc:multicall(Nodes, ?MODULE, readers, [QName]),
+    lists:flatten(Data);
 i(type, _) ->
     stream;
 i(_, _) ->
     ''.
+
+-spec status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
+    [[{binary(), term()}]] | {error, term()}.
+status(Vhost, QueueName) ->
+    %% Handle not found queues
+    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} when ?amqqueue_is_classic(Q) ->
+            {error, classic_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_quorum(Q) ->
+            {error, quorum_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_stream(Q) ->
+            _Pid = amqqueue:get_pid(Q),
+            % Max = maps:get(max_segment_size, Conf, osiris_log:get_default_max_segment_size()),
+            [begin
+                 [{role, Role},
+                  get_key(node, C),
+                  get_key(offset, C),
+                  get_key(committed_offset, C),
+                  get_key(first_offset, C),
+                  get_key(readers, C),
+                  get_key(segments, C)]
+             end || {Role, C} <- get_counters(Q)];
+        {error, not_found} = E ->
+            E
+    end.
+
+get_key(Key, Cnt) ->
+    {Key, maps:get(Key, Cnt, undefined)}.
+
+get_counters(Q) ->
+    #{name := StreamId} = amqqueue:get_type_state(Q),
+    {ok, Members} = rabbit_stream_coordinator:members(StreamId),
+    QName = amqqueue:get_name(Q),
+    Counters = [begin
+                    Data = safe_get_overview(Node),
+                    get_counter(QName, Data, #{node => Node})
+                end || Node <- maps:keys(Members)],
+    lists:filter(fun (X) -> X =/= undefined end, Counters).
+
+safe_get_overview(Node) ->
+    case rpc:call(Node, osiris_counters, overview, []) of
+        {badrpc, _} ->
+            #{node => Node};
+        Data ->
+            Data
+    end.
+
+get_counter(QName, Data, Add) ->
+    case maps:get({osiris_writer, QName}, Data, undefined) of
+        undefined ->
+            case maps:get({osiris_replica, QName}, Data, undefined) of
+                undefined ->
+                    {undefined, Add};
+                M ->
+                    {replica, maps:merge(Add, M)}
+            end;
+        M ->
+            {writer, maps:merge(Add, M)}
+    end.
+
+
+-spec tracking_status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
+    [[{atom(), term()}]] | {error, term()}.
+tracking_status(Vhost, QueueName) ->
+    %% Handle not found queues
+    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} when ?amqqueue_is_classic(Q) ->
+            {error, classic_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_quorum(Q) ->
+            {error, quorum_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_stream(Q) ->
+            Leader = amqqueue:get_pid(Q),
+            Map = osiris:read_tracking(Leader),
+            maps:fold(fun(K, {Type, Value}, Acc) ->
+                              [[{reference, K},
+                                {type, Type},
+                                {value, Value}] | Acc]
+                      end, [], Map);
+        {error, not_found} = E->
+            E
+    end.
+
+readers(QName) ->
+    try
+        Data = osiris_counters:overview(),
+        Readers = case maps:get({osiris_writer, QName}, Data, not_found) of
+                      not_found ->
+                          maps:get(readers, maps:get({osiris_replica, QName}, Data, #{}), 0);
+                      Map ->
+                          maps:get(readers, Map, 0)
+                  end,
+        {node(), Readers}
+    catch
+        _:_ ->
+            {node(), 0}
+    end.
 
 init(Q) when ?is_amqqueue(Q) ->
     Leader = amqqueue:get_pid(Q),
@@ -564,9 +687,7 @@ add_replica(VHost, Name, Node) ->
                 false ->
                     {error, node_not_running};
                 true ->
-                    #{name := StreamId} = amqqueue:get_type_state(Q),
-                    {ok, Reply, _} = rabbit_stream_coordinator:add_replica(StreamId, Node),
-                    Reply
+                    rabbit_stream_coordinator:add_replica(Q, Node)
             end;
         E ->
             E

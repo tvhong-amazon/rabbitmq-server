@@ -1,4 +1,4 @@
-load("@bazel-erlang//:bazel_erlang_lib.bzl", "erlang_lib", "erlc", "test_erlang_lib")
+load("@bazel-erlang//:bazel_erlang_lib.bzl", "erlc")
 load("@bazel-erlang//:ct.bzl", "ct_suite")
 load(
     "//:rabbitmq.bzl",
@@ -6,7 +6,7 @@ load(
     "RABBITMQ_ERLC_OPTS",
     "RABBITMQ_TEST_ERLC_OPTS",
     "rabbitmq_integration_suite",
-    "with_test_versions",
+    "rabbitmq_lib",
 )
 
 exports_files([
@@ -190,7 +190,7 @@ EXTRA_ERLC_OPTS = [
     "-DINSTR_MOD=gm",
 ]
 
-erlang_lib(
+rabbitmq_lib(
     app_description = "RabbitMQ",
     app_env = _APP_ENV,
     app_module = "rabbit",
@@ -200,22 +200,9 @@ erlang_lib(
     erlc_opts = RABBITMQ_ERLC_OPTS + EXTRA_ERLC_OPTS,
     extra_apps = EXTRA_APPS,
     first_srcs = FIRST_SRCS,
+    test_erlc_opts = RABBITMQ_TEST_ERLC_OPTS + EXTRA_ERLC_OPTS,
     runtime_deps = RUNTIME_DEPS,
     deps = DEPS,
-)
-
-test_erlang_lib(
-    app_description = "RabbitMQ",
-    app_env = _APP_ENV,
-    app_module = "rabbit",
-    app_name = "rabbit",
-    app_registered = APP_REGISTERED,
-    app_version = APP_VERSION,
-    erlc_opts = RABBITMQ_TEST_ERLC_OPTS + EXTRA_ERLC_OPTS,
-    extra_apps = EXTRA_APPS,
-    first_srcs = FIRST_SRCS,
-    runtime_deps = with_test_versions(RUNTIME_DEPS),
-    deps = with_test_versions(DEPS),
 )
 
 erlc(
@@ -382,11 +369,34 @@ rabbitmq_integration_suite(
 rabbitmq_integration_suite(
     name = "dynamic_ha_SUITE",
     size = "large",
-    groups = [
-        "cluster_size_5",
-        "cluster_size_2",
-        "cluster_size_3",
-    ],
+    groups = {
+        "cluster_size_5": [
+            "change_cluster",
+        ],
+        "cluster_size_2": [
+            "vhost_deletion",
+            "force_delete_if_no_master",
+            "promote_on_shutdown",
+            "promote_on_failure",
+            "follower_recovers_after_vhost_failure",
+            "follower_recovers_after_vhost_down_and_up",
+            "master_migrates_on_vhost_down",
+            "follower_recovers_after_vhost_down_and_master_migrated",
+            "queue_survive_adding_dead_vhost_mirror",
+            "dynamic_mirroring",
+        ],
+        "cluster_size_3": [
+            "change_policy",
+            "rapid_change",
+            "nodes_policy_should_pick_master_from_its_params",
+            "promote_follower_after_standalone_restart",
+            "queue_survive_adding_dead_vhost_mirror",
+            "rebalance_all",
+            "rebalance_exactly",
+            "rebalance_nodes",
+            "rebalance_multiple_blocked",
+        ],
+    },
     deps = DEPS + [
         "@proper//:bazel_erlang_lib",
     ],
@@ -431,19 +441,44 @@ rabbitmq_integration_suite(
         "registry": {
             "groups": ["registry"],
         },
-        "enabling_on_single_node": {
+        "enabling_on_single_node-enable_feature_flag_in_a_healthy_situation": {
             "groups": ["enabling_on_single_node"],
+            "cases": ["enable_feature_flag_in_a_healthy_situation"],
+        },
+        "enabling_on_single_node-enable_unsupported_feature_flag_in_a_healthy_situation": {
+            "groups": ["enabling_on_single_node"],
+            "cases": ["enable_unsupported_feature_flag_in_a_healthy_situation"],
+        },
+        "enabling_on_single_node-enable_feature_flag_when_ff_file_is_unwritable": {
+            "groups": ["enabling_on_single_node"],
+            "cases": ["enable_feature_flag_when_ff_file_is_unwritable"],
             # The enabling_* tests chmod files and then expect writes to be blocked.
             # This probably doesn't work because we are root in the remote docker image.
             "tags": ["exclusive"],
         },
-        "enabling_in_cluster": {
+        "enabling_in_cluster-enable_feature_flag_in_a_healthy_situation": {
             "groups": ["enabling_in_cluster"],
+            "cases": ["enable_feature_flag_in_a_healthy_situation"],
+        },
+        "enabling_in_cluster-enable_unsupported_feature_flag_in_a_healthy_situation": {
+            "groups": ["enabling_in_cluster"],
+            "cases": ["enable_unsupported_feature_flag_in_a_healthy_situation"],
+        },
+        "enabling_in_cluster-enable_feature_flag_when_ff_file_is_unwritable": {
+            "groups": ["enabling_in_cluster"],
+            "cases": ["enable_feature_flag_when_ff_file_is_unwritable"],
             "flaky": True,
-            "size": "large",
             # The enabling_* tests chmod files and then expect writes to be blocked.
             # This probably doesn't work because we are root in the remote docker image.
             "tags": ["exclusive"],
+        },
+        "enabling_in_cluster-enable_feature_flag_with_a_network_partition": {
+            "groups": ["enabling_in_cluster"],
+            "cases": ["enable_feature_flag_with_a_network_partition"],
+        },
+        "enabling_in_cluster-mark_feature_flag_as_enabled_with_a_network_partition": {
+            "groups": ["enabling_in_cluster"],
+            "cases": ["mark_feature_flag_as_enabled_with_a_network_partition"],
         },
         "clustering": {
             "groups": ["clustering"],
@@ -856,15 +891,21 @@ rabbitmq_integration_suite(
     additional_beam = [
         ":quorum_queue_utils",
     ],
-    groups = [
-        "single_node",
-        "cluster_size_2",
-        "cluster_size_3",
-        "unclustered_size_3_1",
-        "unclustered_size_3_2",
-        "unclustered_size_3_3",
-        "cluster_size_3_1",
-    ],
+    matrix = {
+        "single_node": {"groups": ["single_node"]},
+        "single_node_parallel": {"groups": ["single_node_parallel"]},
+        "cluster_size_2": {"groups": ["cluster_size_2"]},
+        "cluster_size_2_parallel": {"groups": ["cluster_size_2_parallel"]},
+        "cluster_size_3": {"groups": ["cluster_size_3"]},
+        "cluster_size_3_parallel": {
+            "groups": ["cluster_size_3_parallel"],
+            "flaky": True,
+        },
+        "unclustered_size_3_1": {"groups": ["unclustered_size_3_1"]},
+        "unclustered_size_3_2": {"groups": ["unclustered_size_3_2"]},
+        "unclustered_size_3_3": {"groups": ["unclustered_size_3_3"]},
+        "cluster_size_3_1": {"groups": ["cluster_size_3_1"]},
+    },
     deps = DEPS + [
         "@proper//:bazel_erlang_lib",
     ],

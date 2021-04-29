@@ -1,14 +1,14 @@
-load(
-    "@bazel-erlang//:bazel_erlang_lib.bzl",
-    "DEFAULT_ERLC_OPTS",
-    "DEFAULT_TEST_ERLC_OPTS",
-    "erlang_lib",
-    "test_erlang_lib",
-)
+load("@bazel-erlang//:bazel_erlang_lib.bzl", "erlc")
 load("@bazel-erlang//:ct.bzl", "ct_suite")
 load("//:rabbitmq_home.bzl", "rabbitmq_home")
 load("//:rabbitmq_run.bzl", "rabbitmq_run")
-load("//:rabbitmq.bzl", "APP_VERSION")
+load(
+    "//:rabbitmq.bzl",
+    "APP_VERSION",
+    "RABBITMQ_ERLC_OPTS",
+    "RABBITMQ_TEST_ERLC_OPTS",
+    "rabbitmq_lib",
+)
 
 APP_NAME = "rabbitmq_peer_discovery_common"
 
@@ -28,33 +28,22 @@ RUNTIME_DEPS = [
     "//deps/rabbit:bazel_erlang_lib",
 ]
 
-ERLC_OPTS = DEFAULT_ERLC_OPTS + [
+ERLC_OPTS = RABBITMQ_ERLC_OPTS + [
     "-I deps/rabbitmq_peer_discovery_common",
 ]
 
-TEST_ERLC_OPTS = DEFAULT_TEST_ERLC_OPTS + [
+TEST_ERLC_OPTS = RABBITMQ_TEST_ERLC_OPTS + [
     "-I deps/rabbitmq_peer_discovery_common",
-    "+nowarn_export_all",
 ]
 
-erlang_lib(
+rabbitmq_lib(
     app_description = APP_DESCRIPTION,
     app_module = APP_MODULE,
     app_name = APP_NAME,
     app_version = APP_VERSION,
     erlc_opts = ERLC_OPTS,
     extra_apps = EXTRA_APPS,
-    runtime_deps = RUNTIME_DEPS,
-    deps = DEPS,
-)
-
-test_erlang_lib(
-    app_description = APP_DESCRIPTION,
-    app_module = APP_MODULE,
-    app_name = APP_NAME,
-    app_version = APP_VERSION,
-    erlc_opts = TEST_ERLC_OPTS,
-    extra_apps = EXTRA_APPS,
+    test_erlc_opts = TEST_ERLC_OPTS,
     runtime_deps = RUNTIME_DEPS,
     deps = DEPS,
 )

@@ -1,5 +1,7 @@
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@bazel_tools//tools/build_defs/repo:git.bzl", "new_git_repository")
 load("@bazel-erlang//:github.bzl", "github_bazel_erlang_lib")
+load("@bazel-erlang//:hex_archive.bzl", "hex_archive")
 load("@bazel-erlang//:hex_pm.bzl", "hex_pm_bazel_erlang_lib")
 load("//:rabbitmq.bzl", "APP_VERSION")
 
@@ -48,6 +50,31 @@ def rabbitmq_external_deps(rabbitmq_workspace = "@rabbitmq-server"):
     )
 
     hex_pm_bazel_erlang_lib(
+        name = "eetcd",
+        version = "0.3.3",
+        sha256 = "8fb280156ddd1b7b34d0f446c5711832385bff512c05378dcea8362f4f5060d6",
+        runtime_deps = [
+            "@gun//:bazel_erlang_lib",
+        ],
+    )
+
+    http_archive(
+        name = "emqttc",
+        urls = ["https://github.com/rabbitmq/emqttc/archive/remove-logging.zip"],
+        strip_prefix = "emqttc-remove-logging",
+        build_file_content = """load("@bazel-erlang//:bazel_erlang_lib.bzl", "erlang_lib")
+
+erlang_lib(
+    app_name = "emqttc",
+    erlc_opts = [
+        "+warn_export_all",
+        "+warn_unused_import",
+    ],
+)
+""",
+    )
+
+    hex_pm_bazel_erlang_lib(
         name = "enough",
         version = "0.1.0",
         sha256 = "0460c7abda5f5e0ea592b12bc6976b8a5c4b96e42f332059cd396525374bf9a1",
@@ -60,6 +87,18 @@ def rabbitmq_external_deps(rabbitmq_workspace = "@rabbitmq-server"):
         sha256 = "9e9f2aa6ee8e3354f03a3f78283fde93bbe5b1d6f6732caa05d3e43efe02e42c",
         ref = "v0.8.4",
         version = "0.8.4",
+    )
+
+    hex_pm_bazel_erlang_lib(
+        name = "gun",
+        version = "1.3.3",
+        sha256 = "3106ce167f9c9723f849e4fb54ea4a4d814e3996ae243a1c828b256e749041e0",
+        first_srcs = [
+            "src/gun_content_handler.erl",
+        ],
+        runtime_deps = [
+            "@cowlib//:bazel_erlang_lib",
+        ],
     )
 
     http_archive(
@@ -133,13 +172,11 @@ def rabbitmq_external_deps(rabbitmq_workspace = "@rabbitmq-server"):
         ],
     )
 
-    hex_pm_bazel_erlang_lib(
+    hex_archive(
         name = "ranch",
-        first_srcs = [
-            "src/ranch_transport.erl",
-        ],
         version = "2.0.0",
         sha256 = "c20a4840c7d6623c19812d3a7c828b2f1bd153ef0f124cb69c54fe51d8a42ae0",
+        build_file = rabbitmq_workspace + "//:BUILD.ranch",
     )
 
     hex_pm_bazel_erlang_lib(
@@ -171,14 +208,21 @@ def rabbitmq_external_deps(rabbitmq_workspace = "@rabbitmq-server"):
         sha256 = "922cf0dd558b9fdb1326168373315b52ed6a790ba943f6dcbd9ee22a74cebdef",
     )
 
-    github_bazel_erlang_lib(
+    new_git_repository(
         name = "systemd",
-        org = "hauleth",
-        repo = "erlang-systemd",
-        ref = "e732727b0b637eb29e8adc77a4eb46d7ebc0f41a",
-        version = "e732727b0b637eb29e8adc77a4eb46d7ebc0f41a",
-        deps = [
-            "@enough//:bazel_erlang_lib",
+        remote = "https://github.com/hauleth/erlang-systemd.git",
+        commit = "e732727b0b637eb29e8adc77a4eb46d7ebc0f41a",
+        build_file = rabbitmq_workspace + "//:BUILD.systemd",
+        patch_cmds = [
+            INJECT_GIT_VERSION,
         ],
-        sha256 = "41019287b59d995424ad274cd276ccc4a4fbeecc7f35dcd4e44347ba9812b46f",
     )
+
+INJECT_GIT_VERSION = """set -euo pipefail
+V="$(git describe --dirty --abbrev=7 --tags --always --first-parent 2>/dev/null \\
+     || git describe --dirty --abbrev=7 --tags --always 2>/dev/null || true)"
+cat src/systemd.app.src \\
+    | sed "s/{vsn,[[:space:]]git}/{vsn, \\"0.6.0-8-g$V\\"}/" \\
+    > src/systemd.app.src.two
+mv src/systemd.app.src.two src/systemd.app.src
+"""
