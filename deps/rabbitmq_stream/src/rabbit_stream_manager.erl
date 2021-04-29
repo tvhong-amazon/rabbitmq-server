@@ -81,7 +81,7 @@ route(RoutingKey, VirtualHost, SuperStream) ->
                     {route, RoutingKey, VirtualHost, SuperStream}).
 
 -spec partitions(binary(), binary()) ->
-                    {ok, [binary()] | {error, stream_not_found}}.
+                    {ok, [binary()]} | {error, stream_not_found}.
 partitions(VirtualHost, SuperStream) ->
     gen_server:call(?MODULE, {partitions, VirtualHost, SuperStream}).
 
