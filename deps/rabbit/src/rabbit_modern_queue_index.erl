@@ -85,20 +85,27 @@
     %% the queue requests a sync (after a timeout).
     confirms = #{} :: #{seq_id() => rabbit_types:msg_id()},
 
-    %% seq_id() of the next message to be read from disk.
-    %% After the read_marker position there may be messages
-    %% that are in transit (in the in_transit list) that
-    %% will be skipped when setting the next read_marker
-    %% position, or acked (see ack_marker/acks).
-    %%
-    %% When messages in in_transit are requeued we lower
-    %% the read_marker position to the lowest value.
-    read_marker = 0 :: seq_id(),
+%% @todo Currently the queue has too much information about
+%%       what is or is not in the index. It reads entries by
+%%       providing from/to seq_id() instead of asking for N
+%%       entries. A read_marker could become useful to have
+%%       when queues know less because it will always point
+%%       to the next readable message.
+%%
+%%    %% seq_id() of the next message to be read from disk.
+%%    %% After the read_marker position there may be messages
+%%    %% that are in transit (in the in_transit list) that
+%%    %% will be skipped when setting the next read_marker
+%%    %% position, or acked (see ack_marker/acks).
+%%    %%
+%%    %% When messages in in_transit are requeued we lower
+%%    %% the read_marker position to the lowest value.
+%%    read_marker = 0 :: seq_id(),
 
     %% seq_id() of messages that are in-transit. They
     %% could be in-transit because they have been read
     %% by the queue, or delivered to the consumer.
-    in_transit = [] :: [seq_id()],
+    in_transit = range_lists:new() :: range_lists:range_list(),
 
     %% seq_id() of the highest contiguous acked message.
     %% All messages before and including this seq_id()
@@ -240,6 +247,10 @@ reset_state(State = #mqistate{ queue_name     = Name,
 
 -define(RECOVER_COUNT, 1).
 -define(RECOVER_BYTES, 2).
+%% @todo Also count the number of entries dropped because the message wasn't in the index,
+%%       and log something at the end. We could also count the number of bytes dropped.
+%% @todo We may also want to log holes inside files (not holes as in files missing, as
+%%       those can happen in normal conditions, albeit rarely).
 
 recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
         ContainsCheckFun, OnSyncFun, _OnSyncMsgFun) ->
@@ -275,9 +286,7 @@ recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
     %% We double check the ack marker because when the message store has
     %% recovered we might have marked additional messages as acked as
     %% part of the recovery process.
-    State3 = recover_maybe_advance_ack_marker(State2),
-    %% We set the read marker to the first message after the ack marker.
-    State = recover_read_marker(State3),
+    State = recover_maybe_advance_ack_marker(State2),
     %% We can now ensure the current segment file is in a good state and return.
     {Count, Bytes, ensure_segment_file(recover, State)}.
 
@@ -424,31 +433,21 @@ recover_write_marker(State, ContainsCheckFun, CountersRef,
             end
     end.
 
-recover_maybe_advance_ack_marker(State = #mqistate{ ack_marker = AckMarker0,
-                                                    acks = Acks0 }) ->
-    NextAckMarker = case AckMarker0 of
+recover_maybe_advance_ack_marker(State = #mqistate{ ack_marker = AckMarker,
+                                                    acks = Acks }) ->
+    NextAckMarker = case AckMarker of
         undefined -> 0;
-        _ -> AckMarker0 + 1
+        _ -> AckMarker + 1
     end,
-    case lists:member(NextAckMarker, Acks0) of
+    case lists:member(NextAckMarker, Acks) of
         %% The ack_marker must be advanced because we found
         %% the next seq_id() in the acks list.
         true ->
-            AckMarker = highest_continuous_seq_id(Acks0),
-            Acks = lists:dropwhile(
-                fun(AckSeqId) -> AckSeqId =< AckMarker end,
-                Acks0),
-            State#mqistate{ ack_marker = AckMarker,
-                            acks = Acks };
+            update_ack_marker(Acks, State);
         %% The ack_marker is correct.
         false ->
             State
     end.
-
-recover_read_marker(State = #mqistate{ ack_marker = undefined }) ->
-    State; %% Default read_marker is 0.
-recover_read_marker(State = #mqistate{ ack_marker = AckMarker }) ->
-    State#mqistate{ read_marker = AckMarker + 1 }.
 
 -spec terminate(rabbit_types:vhost(), [any()], State) -> State when State::mqistate().
 
@@ -492,21 +491,14 @@ delete_and_terminate(State = #mqistate { dir = Dir,
 %%       here is always a binary, never a record.
 
 publish(MsgOrId, SeqId, Props, IsPersistent, _IsDelivered, TargetRamCount,
-        State0 = #mqistate { write_marker = WriteMarker,
-                             read_marker = ReadMarker0,
-                             in_transit = InTransit })
+        State0 = #mqistate { write_marker = WriteMarker })
         when SeqId < WriteMarker ->
     ?DEBUG("~0p ~0p ~0p ~0p ~0p ~0p", [MsgOrId, SeqId, Props, IsPersistent, TargetRamCount, State0]),
     %% We have already written this message on disk. We do not need
     %% to write it again. We may instead remove it from the in_transit list.
     %% @todo Confirm that this is indeed the behavior we should have.
     %% @todo It would be better to have a separate function for this...
-    ReadMarker = if
-        SeqId < ReadMarker0 -> SeqId;
-        true -> ReadMarker0
-    end,
-    State = State0#mqistate{ read_marker = ReadMarker,
-                             in_transit = InTransit -- [SeqId] },
+    State = remove_from_transit([SeqId], State0),
     %% @todo When messages are "put back" into the index, we may
     %%       not want to write the deliver flag again. This is a
     %%       waste of resources if the message already has the flag.
@@ -523,7 +515,7 @@ publish(MsgOrId, SeqId, Props, IsPersistent, IsDelivered, TargetRamCount,
                              write_buffer = WriteBuffer0 }) ->
     ?DEBUG("~0p ~0p ~0p ~0p ~0p ~0p", [MsgOrId, SeqId, Props, IsPersistent, TargetRamCount, State0]),
     %% When the message was delivered we need to add it to
-    %% the in_transit list and possibly advance the read_marker.
+    %% the in_transit list.
     State1 = case IsDelivered of
         true -> mark_in_transit([SeqId], State0);
         false -> State0
@@ -649,7 +641,7 @@ deliver([], State) ->
 deliver(SeqIds, State0 = #mqistate { write_buffer = WriteBuffer0,
                                      write_buffer_updates = NumUpdates0 }) ->
     ?DEBUG("~0p ~0p", [SeqIds, State0]),
-    %% Update the in_transit list. We also update the read_marker if necessary.
+    %% Update the in_transit list.
     %% @todo Is this still necessary with publish taking care of delivers?
     %%       This was necessary before because publish and deliver were called one after the other.
     State = mark_in_transit(SeqIds, State0),
@@ -674,21 +666,6 @@ deliver(SeqIds, State0 = #mqistate { write_buffer = WriteBuffer0,
     maybe_flush_buffer(State#mqistate{ write_buffer = WriteBuffer,
                                        write_buffer_updates = NumUpdates }).
 
-mark_in_transit(SeqIds, State = #mqistate{ read_marker = ReadMarker0,
-                                           in_transit = InTransit0 }) ->
-    %% @todo Would be good to avoid this lists:sort/1 call.
-    ReadMarker = maybe_advance_read_marker(ReadMarker0, lists:sort(SeqIds)),
-    %% @todo We probably shouldn't do this lists:usort as well. Hacky quick fix.
-    InTransit = lists:usort(SeqIds ++ InTransit0),
-    State#mqistate{ read_marker = ReadMarker, in_transit = InTransit }.
-
-maybe_advance_read_marker(ReadMarker, [ReadMarker]) ->
-    ReadMarker + 1;
-maybe_advance_read_marker(ReadMarker, [ReadMarker|Tail]) ->
-    highest_continuous_seq_id(Tail) + 1;
-maybe_advance_read_marker(ReadMarker, _) ->
-    ReadMarker.
-
 %% When marking acks we need to update the file(s) on disk
 %% as well as update ack_marker and/or acks in the state.
 %% When a file has been fully acked we may also close its
@@ -703,18 +680,15 @@ ack([], State) ->
     State;
 ack(SeqIds0, State0 = #mqistate{ write_buffer = WriteBuffer0,
                                  write_buffer_updates = NumUpdates0,
-                                 in_transit = InTransit0,
                                  ack_marker = AckMarkerBefore }) ->
     ?DEBUG("~0p ~0p", [SeqIds0, State0]),
     %% We start by removing all the messages that were in transit.
-    %% @todo Also remove everything below the ack_marker? Not sure why it's not all in the SeqIds...
-    %%       No. If there are things left in in_transit, that's because they were added to the list twice.
-    InTransit = InTransit0 -- SeqIds0,
+    State1 = remove_from_transit(SeqIds0, State0),
     %% We continue by updating the ack state information. We then
     %% use this information to determine if we can delete
     %% segment files on disk.
-    State1 = update_ack_state(SeqIds0, State0),
-    {HighestSegmentDeleted, State} = maybe_delete_segments(AckMarkerBefore, State1),
+    State2 = update_ack_state(SeqIds0, State1),
+    {HighestSegmentDeleted, State} = maybe_delete_segments(AckMarkerBefore, State2),
     %% When there were deleted files, we remove the seq_id()s that
     %% belong to deleted files from the acked list, as well as any
     %% write instructions in the buffer targeting those files.
@@ -757,8 +731,7 @@ ack(SeqIds0, State0 = #mqistate{ write_buffer = WriteBuffer0,
             end
     end, {WriteBuffer2, NumUpdates2}, SeqIds),
     maybe_flush_buffer(State#mqistate{ write_buffer = WriteBuffer,
-                                       write_buffer_updates = NumUpdates,
-                                       in_transit = InTransit }).
+                                       write_buffer_updates = NumUpdates }).
 
 update_ack_state(SeqIds, State = #mqistate{ ack_marker = undefined, acks = Acks0 }) ->
     Acks = lists:sort(SeqIds ++ Acks0),
@@ -766,7 +739,7 @@ update_ack_state(SeqIds, State = #mqistate{ ack_marker = undefined, acks = Acks0
     %% The message with seq_id() 0 has not been acked before now.
     case Acks of
         [0|_] ->
-            update_markers(Acks, State);
+            update_ack_marker(Acks, State);
         _ ->
             State#mqistate{ acks = Acks }
     end;
@@ -778,25 +751,17 @@ update_ack_state(SeqIds, State = #mqistate{ ack_marker = AckMarker, acks = Acks0
         %% new ack marker becomes the largest continuous seq_id() found in
         %% Acks.
         [SeqId|_] when SeqId =:= AckMarker + 1 ->
-            update_markers(Acks, State);
+            update_ack_marker(Acks, State);
         _ ->
             State#mqistate{ acks = Acks }
     end.
 
-update_markers(Acks, State = #mqistate { read_marker = ReadMarker0 }) ->
+update_ack_marker(Acks, State) ->
     AckMarker = highest_continuous_seq_id(Acks),
     RemainingAcks = lists:dropwhile(
         fun(AckSeqId) -> AckSeqId =< AckMarker end,
         Acks),
-    %% Advance the read_marker if the ack_marker got past it.
-    %% @todo This is only necessary if acks can arrive after a
-    %%       dirty shutdown I believe.
-    ReadMarker = if
-        AckMarker >= ReadMarker0 -> AckMarker + 1;
-        true -> ReadMarker0
-    end,
-    State#mqistate{ read_marker = ReadMarker,
-                    ack_marker = AckMarker,
+    State#mqistate{ ack_marker = AckMarker,
                     acks = RemainingAcks }.
 
 maybe_delete_segments(AckMarkerBefore, State = #mqistate{ ack_marker = AckMarkerAfter }) ->
@@ -851,76 +816,83 @@ delete_segment(Segment, State0 = #mqistate{ fds = OpenFds0 }) ->
                      when State::mqistate().
 
 %% From is inclusive, To is exclusive.
-%% @todo This function is incompatible with the rabbit_queue_index function.
-%%       In our case we may send messages >= ToSeqId. As a result the
-%%       rabbit_variable_queue module may need to be accomodated.
 
-read(FromSeqId, FromSeqId, State) ->
-    ?DEBUG("~0p ~0p ~0p", [FromSeqId, FromSeqId, State]),
+%% Nothing to read because the second argument is exclusive.
+read(FromSeqId, ToSeqId, State)
+        when FromSeqId =:= ToSeqId ->
+    ?DEBUG("~0p ~0p ~0p", [FromSeqId, ToSeqId, State]),
     {[], State};
+%% Nothing to read because there is nothing at or before the ack marker.
+read(FromSeqId, ToSeqId, State = #mqistate{ ack_marker = AckMarker })
+        when ToSeqId =< AckMarker, AckMarker =/= undefined ->
+    ?DEBUG("~0p ~0p ~0p", [FromSeqId, ToSeqId, State]),
+    {[], State};
+%% Nothing to read because there is nothing at or past the write marker.
+read(FromSeqId, ToSeqId, State = #mqistate{ write_marker = WriteMarker })
+        when FromSeqId >= WriteMarker ->
+    ?DEBUG("~0p ~0p ~0p", [FromSeqId, ToSeqId, State]),
+    {[], State};
+%% We can only read from the message after the ack marker.
+read(FromSeqId, ToSeqId, State = #mqistate{ ack_marker = AckMarker })
+        when FromSeqId =< AckMarker, AckMarker =/= undefined ->
+    ?DEBUG("~0p ~0p ~0p", [FromSeqId, ToSeqId, State]),
+    read(AckMarker + 1, ToSeqId, State);
+%% We can only read up to the message before the write marker.
+read(FromSeqId, ToSeqId, State = #mqistate{ write_marker = WriteMarker })
+        when ToSeqId > WriteMarker ->
+    ?DEBUG("~0p ~0p ~0p", [FromSeqId, ToSeqId, State]),
+    read(FromSeqId, WriteMarker, State);
+%% Read the messages requested.
 read(FromSeqId, ToSeqId, State) ->
     ?DEBUG("~0p ~0p ~0p", [FromSeqId, ToSeqId, State]),
-    %% @todo Temporary read_marker here. Yeah we really ought to follow the same interface... Sigh.
-    read(ToSeqId - FromSeqId, State#mqistate{ read_marker = FromSeqId }).
+    read({FromSeqId, ToSeqId - 1}, State).
 
-%% There might be messages after the read marker that were acked.
-%% We need to skip those messages when we attempt to read them.
-
-read(_, State = #mqistate{ write_marker = WriteMarker,
-                           read_marker = ReadMarker })
-        when WriteMarker =:= ReadMarker ->
-    {[], State};
-read(Num, State0 = #mqistate{ write_marker = WriteMarker,
-                              write_buffer = WriteBuffer,
-                              read_marker = ReadMarker,
-                              in_transit = InTransit0,
-                              acks = Acks  }) ->
-    %% The first message is always readable. It cannot be acked
-    %% because if it was, the ack_marker would advance, and the
-    %% read_marker would advance as well. It cannot be in_transit,
-    %% because if it was, the read_marker would advance to reflect
-    %% that as well.
-    {NextReadMarker, SeqIdsToRead0} = prepare_read(Num - 1, WriteMarker,
-                                                   ReadMarker + 1, InTransit0,
-                                                   Acks, []),
-    SeqIdsToRead = [ReadMarker|SeqIdsToRead0],
+read(Range, State0 = #mqistate{ write_buffer = WriteBuffer,
+                                in_transit = InTransit0,
+                                acks = Acks }) ->
+    SeqIdsToRead = prepare_read(Range, InTransit0, Acks),
     %% We first try to read from the write buffer what we can,
     %% then we read the rest from disk.
     {Reads0, SeqIdsOnDisk} = read_from_buffer(SeqIdsToRead,
                                               WriteBuffer,
                                               [], []),
-    {Reads, State} = read_from_disk(SeqIdsOnDisk,
-                                    State0,
-                                    Reads0),
+    {Reads, State1} = read_from_disk(SeqIdsOnDisk,
+                                     State0,
+                                     Reads0),
     %% We add the messages that have been read to the in_transit list.
-    InTransit = lists:foldl(fun({_, SeqId, _, _, _}, Acc) -> [SeqId|Acc] end,
-                            InTransit0, Reads),
-    {Reads, State#mqistate{ read_marker = NextReadMarker,
-                            in_transit = InTransit }}.
+    SeqIdsInTransit = lists:foldl(fun({_, SeqId, _, _, _}, Acc) -> [SeqId|Acc] end,
+                                  [], Reads),
+    State = mark_in_transit(SeqIdsInTransit, State1),
+    {Reads, State}.
 
-%% Return when we have found as many messages as requested.
-prepare_read(0, _, ReadMarker, _, _, Acc) ->
-    {ReadMarker, lists:reverse(Acc)};
-%% Return when we have reached the end of messages in the index.
-prepare_read(_, WriteMarker, ReadMarker, _, _, Acc)
-        when WriteMarker =:= ReadMarker ->
-    {ReadMarker, lists:reverse(Acc)};
-%% For each seq_id() we may read, we check whether they are in
-%% the in_transit list or in the acks list. If they are, we should
-%% not read them. Otherwise we add them to the list of messages
-%% that we want to read.
-prepare_read(Num, WriteMarker, ReadMarker, InTransit, Acks, Acc) ->
-    %% We arbitrarily look into the in_transit list first.
-    %% It is unknown whether looking into the acks list
-    %% first would provide better performance.
-    Skip = lists:member(ReadMarker, lists:usort(InTransit))
-        orelse lists:member(ReadMarker, Acks),
-    case Skip of
-        true ->
-            prepare_read(Num, WriteMarker, ReadMarker + 1, InTransit, Acks, Acc);
-        false ->
-            prepare_read(Num - 1, WriteMarker, ReadMarker + 1, InTransit, Acks, [ReadMarker|Acc])
-    end.
+%%% Return when we have found as many messages as requested.
+%prepare_read(0, _, ReadMarker, _, _, Acc) ->
+%    {ReadMarker, lists:reverse(Acc)};
+%%% Return when we have reached the end of messages in the index.
+%prepare_read(_, WriteMarker, ReadMarker, _, _, Acc)
+%        when WriteMarker =:= ReadMarker ->
+%    {ReadMarker, lists:reverse(Acc)};
+%%% For each seq_id() we may read, we check whether they are in
+%%% the in_transit list or in the acks list. If they are, we should
+%%% not read them. Otherwise we add them to the list of messages
+%%% that we want to read.
+%prepare_read(Num, WriteMarker, ReadMarker, InTransit, Acks, Acc) ->
+%    %% We arbitrarily look into the in_transit list first.
+%    %% It is unknown whether looking into the acks list
+%    %% first would provide better performance.
+%    Skip = is_in_transit( lists:member(ReadMarker, lists:usort(InTransit))
+%        orelse lists:member(ReadMarker, Acks),
+%    case Skip of
+%        true ->
+%            prepare_read(Num, WriteMarker, ReadMarker + 1, InTransit, Acks, Acc);
+%        false ->
+%            prepare_read(Num - 1, WriteMarker, ReadMarker + 1, InTransit, Acks, [ReadMarker|Acc])
+%    end.
+
+prepare_read(Range, InTransit, Acks) ->
+    RangeList = range_lists:subtract_range(Range, InTransit),
+    ToRead = range_lists:to_list(RangeList),
+    ToRead -- Acks.
 
 read_from_buffer([], _, SeqIdsOnDisk, Reads) ->
     {Reads, SeqIdsOnDisk};
@@ -1009,6 +981,16 @@ parse_entries(<< Status:8,
             parse_entries(Rest, SeqId + 1, Acc)
     end.
 
+%% Mark/remove from transit.
+
+mark_in_transit(SeqIds, State = #mqistate{ in_transit = InTransit0 }) ->
+    InTransit = range_lists:merge(range_lists:from_list(SeqIds), InTransit0),
+    State#mqistate{ in_transit = InTransit }.
+
+remove_from_transit(SeqIds, State = #mqistate{ in_transit = InTransit0 }) ->
+    InTransit = range_lists:subtract(range_lists:from_list(SeqIds), InTransit0),
+    State#mqistate{ in_transit = InTransit }.
+
 %% ----
 %%
 %% Defer to rabbit_queue_index for recovery for the time being.
@@ -1034,9 +1016,6 @@ pre_publish(MsgOrId, SeqId, Props, IsPersistent, IsDelivered, TargetRamCount, St
     %% @todo I don't know what this is but we only want to write if we have never
     %% written before? And we want to write in the right order.
     %% @todo Do something about IsDelivered too? I don't understand this function.
-    %% I think it's to allow sending the message to the consumer before writing to the index.
-    %% If it is delivered then we need to increase our read_marker. If that doesn't work
-    %% then we can always keep a list of delivered messages in memory? -> probably necessary
 
 %% @todo -spec flush_pre_publish_cache(???, State) -> State when State::mqistate().
 
@@ -1089,8 +1068,12 @@ flush(State) ->
                        when State::mqistate().
 
 bounds(State = #mqistate{ write_marker = Newest,
-                          read_marker = Oldest }) ->
+                          ack_marker = AckMarker }) ->
     ?DEBUG("~0p", [State]),
+    Oldest = case AckMarker of
+        undefined -> 0;
+        _ -> AckMarker + 1
+    end,
     {Oldest, Newest, State}.
 
 %% The next_segment_boundary/1 function is used internally when
