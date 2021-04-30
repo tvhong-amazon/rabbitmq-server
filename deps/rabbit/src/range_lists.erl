@@ -3,9 +3,7 @@
 -export([new/0]).
 -export([from_list/1]).
 -export([to_list/1]).
--export([add_range/2]).
 -export([merge/2]).
--export([remove_range/2]).
 -export([subtract/2]).
 -export([subtract_range/2]).
 
@@ -52,21 +50,6 @@ seq_loop(1, X, L) ->
 seq_loop(0, _, L) ->
      L.
 
-%% @todo This is not used. Also it expects ranges not overlapping.
--spec add_range(range(), RangeList) -> RangeList
-    when RangeList :: range_list().
-
-add_range(Range, []) ->
-    [Range];
-add_range({Lo, Hi}, [{CurLo, CurHi}|Tail]) when Hi + 1 =:= CurLo ->
-    add_range({Lo, CurHi}, Tail);
-add_range({Lo, Hi}, [{CurLo, CurHi}|Tail]) when Lo - 1 =:= CurHi ->
-    add_range({CurLo, Hi}, Tail);
-add_range(Range = {_, Hi}, [CurRange = {CurLo, _}|Tail]) when Hi < CurLo ->
-    [Range, CurRange|Tail];
-add_range(Range, [CurRange|Tail]) ->
-    [CurRange|add_range(Range, Tail)].
-
 -spec merge(RangeList, RangeList) -> RangeList
     when RangeList :: range_list().
 
@@ -89,25 +72,6 @@ merge([{LLo, _}|LTail], [{RLo, RHi}|RTail]) when LLo =< RLo -> %% LHi < RHi
     merge([{LLo, RHi}|LTail], RTail);
 merge([{_, LHi}|LTail], [{RLo, _}|RTail]) -> %% RLo =< LLo, RHi < LHi
     merge([{RLo, LHi}|LTail], RTail).
-
-%% @todo This is not used.
--spec remove_range(range(), RangeList) -> RangeList
-    when RangeList :: range_list().
-
-remove_range(_, []) ->
-    [];
-remove_range(Range = {Lo, _}, [CurRange = {_, CurHi}|Tail]) when Lo > CurHi ->
-    [CurRange|remove_range(Range, Tail)];
-remove_range({_, Hi}, RangeList = [{CurLo, _}|_]) when Hi < CurLo ->
-    RangeList;
-remove_range(Range = {Lo, Hi}, [{CurLo, CurHi}|Tail]) when Lo =< CurLo, Hi >= CurHi ->
-    remove_range(Range, Tail);
-remove_range({Lo, Hi}, [{CurLo, CurHi}|Tail]) when Lo =< CurLo -> %% Hi < CurHi
-    [{Hi + 1, CurHi}|Tail];
-remove_range(Range = {Lo, Hi}, [{CurLo, CurHi}|Tail]) when Hi >= CurHi -> %% Lo > CurLo
-    [{CurLo, Lo - 1}|remove_range(Range, Tail)];
-remove_range({Lo, Hi}, [{CurLo, CurHi}|Tail]) -> %% Lo > CurLo, Hi < CurHi
-    [{CurLo, Lo - 1}, {Hi + 1, CurHi}|Tail].
 
 -spec subtract(RangeList, RangeList) -> RangeList
     when RangeList :: range_list().
@@ -159,28 +123,13 @@ test() ->
     List = to_list(RangeList),
     List = to_list(from_list(List)),
 
-    %% add_range
-    F = fun add_range/2,
-    [{1,40}] = F({1,1}, F({8,9}, F({21,29}, F({5,7}, F({2,4}, F({30,40}, F({10,20}, []))))))),
-
     %% merge
+    F = fun merge/2,
+    [{1,40}] = F([{1,1}], F([{8,9}], F([{21,29}], F([{5,7}], F([{2,4}], F([{30,40}], F([{10,20}], []))))))),
     [{1,40}] = merge([{7,15}], [{1,40}]),
     [{1,40}] = merge([{7,15}], [{1,6}, {16,40}]),
     [{1,40}] = merge([{7,15}], [{1,8}, {14,40}]),
     [{1,10}, {21,30}, {41,50}, {61,70}] = merge([{1,10}, {41,50}], [{21,30}, {61,70}]),
-
-    %% remove_range
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,40}]),
-    [{19,19}, {26,26}] = remove_range({20,25}, [{19,19}, {26,26}]),
-    [] = remove_range({20,25}, [{20,25}]),
-    [] = remove_range({20,25}, [{20,20}, {25,25}]),
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,19}, {23,23}, {25,40}]),
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,20}, {23,23}, {25,40}]),
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,21}, {23,23}, {25,40}]),
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,21}, {23,23}, {24,40}]),
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,21}, {23,23}, {25,40}]),
-    [{1,19}, {26,40}] = remove_range({20,25}, [{1,21}, {23,23}, {26,40}]),
-    [] = remove_range({1,1}, [{1,1}]),
 
     %% subtract
     [{1,19}, {26,40}] = subtract([{20,25}], [{1,40}]),

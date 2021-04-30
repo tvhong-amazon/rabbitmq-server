@@ -865,30 +865,6 @@ read(Range, State0 = #mqistate{ write_buffer = WriteBuffer,
     State = mark_in_transit(SeqIdsInTransit, State1),
     {Reads, State}.
 
-%%% Return when we have found as many messages as requested.
-%prepare_read(0, _, ReadMarker, _, _, Acc) ->
-%    {ReadMarker, lists:reverse(Acc)};
-%%% Return when we have reached the end of messages in the index.
-%prepare_read(_, WriteMarker, ReadMarker, _, _, Acc)
-%        when WriteMarker =:= ReadMarker ->
-%    {ReadMarker, lists:reverse(Acc)};
-%%% For each seq_id() we may read, we check whether they are in
-%%% the in_transit list or in the acks list. If they are, we should
-%%% not read them. Otherwise we add them to the list of messages
-%%% that we want to read.
-%prepare_read(Num, WriteMarker, ReadMarker, InTransit, Acks, Acc) ->
-%    %% We arbitrarily look into the in_transit list first.
-%    %% It is unknown whether looking into the acks list
-%    %% first would provide better performance.
-%    Skip = is_in_transit( lists:member(ReadMarker, lists:usort(InTransit))
-%        orelse lists:member(ReadMarker, Acks),
-%    case Skip of
-%        true ->
-%            prepare_read(Num, WriteMarker, ReadMarker + 1, InTransit, Acks, Acc);
-%        false ->
-%            prepare_read(Num - 1, WriteMarker, ReadMarker + 1, InTransit, Acks, [ReadMarker|Acc])
-%    end.
-
 prepare_read(Range, InTransit, Acks) ->
     RangeList = range_lists:subtract_range(Range, InTransit),
     ToRead = range_lists:to_list(RangeList),
@@ -993,6 +969,45 @@ remove_from_transit(SeqIds, State = #mqistate{ in_transit = InTransit0 }) ->
 
 %% ----
 %%
+%% Syncing and flushing to disk requested by the queue.
+
+-spec sync(State) -> State when State::mqistate().
+
+sync(State0 = #mqistate{ confirms = Confirms,
+                         fds = OpenFds,
+                         on_sync = OnSyncFun }) ->
+    ?DEBUG("~0p", [State0]),
+    State = flush_buffer(State0, full),
+    %% Call file:sync/1 on all open FDs. Some of them might not have
+    %% writes but for the time being we don't discriminate.
+    _ = maps:fold(fun(_, Fd, _) ->
+        ok = file:sync(Fd)
+    end, undefined, OpenFds),
+    %% Notify syncs.
+    Set = gb_sets:from_list(maps:values(Confirms)),
+    OnSyncFun(Set),
+    %% Reset confirms.
+    State#mqistate{ confirms = #{} }.
+
+-spec needs_sync(mqistate()) -> 'false'.
+
+needs_sync(State = #mqistate{ confirms = Confirms }) ->
+    ?DEBUG("~0p", [State]),
+    case Confirms =:= #{} of
+        true -> false;
+        false -> confirms
+    end.
+
+-spec flush(State) -> State when State::mqistate().
+
+flush(State) ->
+    ?DEBUG("~0p", [State]),
+    %% Flushing to disk is the same operation as sync
+    %% except it is called before hibernating.
+    sync(State).
+
+%% ----
+%%
 %% Defer to rabbit_queue_index for recovery for the time being.
 %% @todo This is most certainly wrong.
 
@@ -1021,42 +1036,6 @@ pre_publish(MsgOrId, SeqId, Props, IsPersistent, IsDelivered, TargetRamCount, St
 
 flush_pre_publish_cache(TargetRamCount, State) ->
     ?DEBUG("~0p ~0p", [TargetRamCount, State]),
-    State.
-
--spec sync(State) -> State when State::mqistate().
-
-%% @todo Move this elsewhere.
-sync(State0 = #mqistate{ confirms = Confirms,
-                         fds = OpenFds,
-                         on_sync = OnSyncFun }) ->
-    ?DEBUG("~0p", [State0]),
-    State = flush_buffer(State0, full),
-    %% Call file:sync/1 on all open FDs. Some of them might not have
-    %% writes but for the time being we don't discriminate.
-    _ = maps:fold(fun(_, Fd, _) ->
-        ok = file:sync(Fd)
-    end, undefined, OpenFds),
-    %% Notify syncs.
-    Set = gb_sets:from_list(maps:values(Confirms)),
-    OnSyncFun(Set),
-    %% Reset confirms.
-    State#mqistate{ confirms = #{} }.
-
--spec needs_sync(mqistate()) -> 'false'.
-
-%% @todo Move this elsewhere.
-needs_sync(State = #mqistate{ confirms = Confirms }) ->
-    ?DEBUG("~0p", [State]),
-    case Confirms =:= #{} of
-        true -> false;
-        false -> confirms
-    end.
-
--spec flush(State) -> State when State::mqistate().
-
-%% @todo We might need this as well? Lower memory usage before hibernate.
-flush(State) ->
-    ?DEBUG("~0p", [State]),
     State.
 
 %% See comment in rabbit_queue_index:bounds/1. We do not need to be
