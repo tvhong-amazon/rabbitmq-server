@@ -190,12 +190,15 @@ smoke(Config) ->
     bind(Ch, <<"amq.fanout">>, <<"fanout2">>),
     publish(Ch, <<"amq.fanout">>, <<"foo">>, <<"fanout">>),
 
-    %% publish and get with manual ack
-    % publish(Ch, QName, <<"autoack">>),
-    % basic_get_autoack(Ch, QName),
+    %% publish and get with auto ack
+    publish(Ch, QName, <<"autoack">>),
+    basic_get_autoack(Ch, QName),
+
+    % publish an consume ack
+    publish(Ch, QName, <<"consume_ack">>),
+    subscribe(Ch, QName, <<"consume_ack">>),
 
     close_channel(Ch),
-
 
     ?assertEqual(get_global_counters(Config),
         #{
@@ -203,10 +206,10 @@ smoke(Config) ->
             messages_delivered_consume_ack_total => 0,
             messages_delivered_consume_autoack_total => 0,
             messages_delivered_get_ack_total => 2,
-            messages_delivered_get_autoack_total => 0,
-            messages_published_total => 5,
+            messages_delivered_get_autoack_total => 1,
+            messages_published_total => 7,
             messages_redelivered_total => 0,
-            messages_routed_total => 4,
+            messages_routed_total => 6,
             messages_unroutable_dropped_total => 1,
             messages_unroutable_returned_total => 1
         }
@@ -277,15 +280,20 @@ publish(Ch, Exchange, RoutingKey, Msg, mandatory) ->
     ok = amqp_channel:cast(Ch,
                            #'basic.publish'{exchange = Exchange, routing_key = RoutingKey, mandatory = true},
                            #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
-                                     payload = Msg}),
-    receive
-        #'basic.cancel_ok'{} ->
-            ok;
-        #'basic.return'{} ->
-            ok
-    after 5000 ->
-              exit(basic_publish_timeout)
-    end.
+                                     payload = Msg}).
+    % receive
+    %     _ -> ok
+    % after 5000 ->
+    %           exit(basic_publish_timeout)
+    % end.
+    % receive
+    %     #'basic.cancel_ok'{} ->
+    %         ok;
+    %     #'basic.return'{} ->
+    %         ok
+    % after 5000 ->
+    %           exit(basic_publish_timeout)
+    % end.
 
 basic_get(Ch, Queue) ->
     {GetOk, _} = Reply = amqp_channel:call(Ch, #'basic.get'{queue = Queue,
@@ -294,14 +302,12 @@ basic_get(Ch, Queue) ->
     GetOk#'basic.get_ok'.delivery_tag.
 
 basic_get_autoack(Ch, Queue) ->
-    ?assertMatch(#'basic.get_empty'{},
-                amqp_channel:call(Ch, #'basic.get'{queue = Queue,
-                                                   no_ack = true})).
+    amqp_channel:call(Ch, #'basic.get'{queue = Queue, no_ack = true}).
 
 basic_get_empty(Ch, Queue) ->
     ?assertMatch(#'basic.get_empty'{},
                 amqp_channel:call(Ch, #'basic.get'{queue = Queue,
-                                                   no_ack = false})).
+                                                   no_ack = true})).
 
 subscribe(Ch, Queue, CTag) ->
     amqp_channel:subscribe(Ch, #'basic.consume'{queue = Queue,
