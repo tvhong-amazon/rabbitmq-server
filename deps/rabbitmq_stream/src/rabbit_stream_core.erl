@@ -133,24 +133,24 @@ init(_) ->
 %% TODO: check max frame size
 incoming_data(<<>>, #?MODULE{frames = Frames} = State) ->
     {State#?MODULE{frames = []}, parse_frames(Frames)};
-incoming_data(<<Size:32/unsigned, Frame:Size/binary, Rem/binary>>,
+incoming_data(<<Size:32, Frame:Size/binary, Rem/binary>>,
               #?MODULE{frames = Frames,
                        data = undefined} = State) ->
     incoming_data(Rem, State#?MODULE{frames = [Frame | Frames],
                                      data = undefined});
-incoming_data(<<Size:32/unsigned, Rem/binary>>,
+incoming_data(<<Size:32, Rem/binary>>,
               #?MODULE{frames = Frames,
                        data = undefined} = State) ->
     %% not enough data to complete frame, stash and await more data
     {State#?MODULE{frames = [],
-                   data = {Size, Rem}},
+                   data = {Size - byte_size(Rem), Rem}},
      parse_frames(Frames)};
 incoming_data(Data,
               #?MODULE{frames = Frames,
                        data = {Size, Partial}} = State) ->
     case Data of
         <<Data:Size/binary, Rem/binary>> ->
-            incoming_data(Rem, State#?MODULE{frames = [append_data(Partial, [Data])
+            incoming_data(Rem, State#?MODULE{frames = [append_data(Partial, Data)
                                                        | Frames],
                                              data = undefined});
         Rem ->
