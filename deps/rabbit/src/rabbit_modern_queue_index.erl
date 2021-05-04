@@ -339,7 +339,7 @@ recover_ack_marker(State, ContainsCheckFun, CountersRef,
                     recover_write_marker(State#mqistate{ ack_marker = AckMarker },
                                          ContainsCheckFun, CountersRef,
                                          Fd, FdSegment, SegmentEntryCount,
-                                         SeqId + 1, Segments, []);
+                                         SeqId, Segments, []);
                 %% We found a non-entry. Everything was acked.
                 %%
                 %% @todo We may want to find out whether this is a hole in the file
@@ -764,6 +764,9 @@ update_ack_marker(Acks, State) ->
     State#mqistate{ ack_marker = AckMarker,
                     acks = RemainingAcks }.
 
+maybe_delete_segments(_, State = #mqistate{ ack_marker = undefined }) ->
+    %% When the ack_marker is undefined, do nothing.
+    {undefined, State};
 maybe_delete_segments(AckMarkerBefore, State = #mqistate{ ack_marker = AckMarkerAfter }) ->
     SegmentEntryCount = segment_entry_count(),
     %% We add one because the ack_marker points to the highest
@@ -856,9 +859,11 @@ read(Range, State0 = #mqistate{ write_buffer = WriteBuffer,
     {Reads0, SeqIdsOnDisk} = read_from_buffer(SeqIdsToRead,
                                               WriteBuffer,
                                               [], []),
-    {Reads, State1} = read_from_disk(SeqIdsOnDisk,
-                                     State0,
-                                     Reads0),
+    {Reads1, State1} = read_from_disk(SeqIdsOnDisk,
+                                      State0,
+                                      Reads0),
+    %% The messages may not be in the correct order. Fix that.
+    Reads = lists:keysort(2, Reads1),
     %% We add the messages that have been read to the in_transit list.
     SeqIdsInTransit = lists:foldl(fun({_, SeqId, _, _, _}, Acc) -> [SeqId|Acc] end,
                                   [], Reads),
@@ -871,7 +876,9 @@ prepare_read(Range, InTransit, Acks) ->
     ToRead -- Acks.
 
 read_from_buffer([], _, SeqIdsOnDisk, Reads) ->
-    {Reads, SeqIdsOnDisk};
+    %% We must do a lists:reverse here so that we are able
+    %% to read multiple continuous messages from disk in one call.
+    {Reads, lists:reverse(SeqIdsOnDisk)};
 read_from_buffer([SeqId|Tail], WriteBuffer, SeqIdsOnDisk, Reads) ->
     case WriteBuffer of
         #{SeqId := ack} ->
