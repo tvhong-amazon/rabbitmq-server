@@ -828,26 +828,26 @@ listen_loop_post_close(Transport,
             rabbit_log:warning("Ignored message on closing ~p", [M])
     end.
 
-handle_inbound_data_pre_auth(Transport, Connection, State, Rest) ->
+handle_inbound_data_pre_auth(Transport, Connection, State, Data) ->
     handle_inbound_data(Transport,
                         Connection,
                         State,
-                        Rest,
-                        fun handle_frame_pre_auth/5).
+                        Data,
+                        fun handle_frame_pre_auth/4).
 
-handle_inbound_data_post_auth(Transport, Connection, State, Rest) ->
+handle_inbound_data_post_auth(Transport, Connection, State, Data) ->
     handle_inbound_data(Transport,
                         Connection,
                         State,
-                        Rest,
-                        fun handle_frame_post_auth/5).
+                        Data,
+                        fun handle_frame_post_auth/4).
 
-handle_inbound_data_post_close(Transport, Connection, State, Rest) ->
+handle_inbound_data_post_close(Transport, Connection, State, Data) ->
     handle_inbound_data(Transport,
                         Connection,
                         State,
-                        Rest,
-                        fun handle_frame_post_close/5).
+                        Data,
+                        fun handle_frame_post_close/4).
 
 handle_inbound_data(Transport,
                     Connection,
@@ -859,71 +859,13 @@ handle_inbound_data(Transport,
             {Connection,
              State#stream_connection_state{data = CoreState}};
         {CoreState, Commands} ->
-            {Connection1, State1, _} =
             lists:foldl(
-              fun (Command, {C, S, R}) ->
-                      HandleFrameFun(Transport, C, S, Command, R)
+              fun (Command, {C, S}) ->
+                      HandleFrameFun(Transport, C, S, Command)
               end, {Connection,
-                    State#stream_connection_state{data = CoreState},
-                    <<>>}, Commands),
-            {Connection1, State1}
+                    State#stream_connection_state{data = CoreState}},
+              Commands)
     end.
-
-% handle_inbound_data(_Transport,
-%                     Connection,
-%                     State,
-%                     <<>>,
-%                     _HandleFrameFun) ->
-%     {Connection, State};
-% handle_inbound_data(Transport,
-%                     #stream_connection{frame_max = FrameMax} = Connection,
-%                     #stream_connection_state{data = none} = State,
-%                     <<Size:32, _Frame:Size/binary, _Rest/bits>>,
-%                     _HandleFrameFun)
-%     when FrameMax /= 0 andalso Size > FrameMax - 4 ->
-%     CloseReason = <<"frame too large">>,
-%     CloseReasonLength = byte_size(CloseReason),
-%     CloseFrame =
-%         <<?REQUEST:1,
-%           ?COMMAND_CLOSE:15,
-%           ?VERSION_1:16,
-%           1:32,
-%           ?RESPONSE_CODE_FRAME_TOO_LARGE:16,
-%           CloseReasonLength:16,
-%           CloseReason:CloseReasonLength/binary>>,
-%     frame(Transport, Connection, CloseFrame),
-%     {Connection#stream_connection{connection_step = close_sent}, State};
-% handle_inbound_data(Transport,
-%                     Connection,
-%                     #stream_connection_state{data = none} = State,
-%                     <<Size:32, Frame:Size/binary, Rest/bits>>,
-%                     HandleFrameFun) ->
-%     {Connection1, State1, Rest1} =
-%         HandleFrameFun(Transport, Connection, State, Frame, Rest),
-%     handle_inbound_data(Transport,
-%                         Connection1,
-%                         State1,
-%                         Rest1,
-%                         HandleFrameFun);
-% handle_inbound_data(_Transport,
-%                     Connection,
-%                     #stream_connection_state{data = none} = State,
-%                     Data,
-%                     _HandleFrameFun) ->
-%     {Connection, State#stream_connection_state{data = Data}};
-% handle_inbound_data(Transport,
-%                     Connection,
-%                     #stream_connection_state{data = Leftover} = State,
-%                     Data,
-%                     HandleFrameFun) ->
-%     State1 = State#stream_connection_state{data = none},
-%     %% FIXME avoid concatenation to avoid a new binary allocation
-%     %% see osiris_replica:parse_chunk/3
-%     handle_inbound_data(Transport,
-%                         Connection,
-%                         State1,
-%                         <<Leftover/binary, Data/binary>>,
-%                         HandleFrameFun).
 
 generate_publishing_error_details(Acc, _Code, <<>>) ->
     Acc;
@@ -940,8 +882,7 @@ handle_frame_pre_auth(Transport,
                       #stream_connection{socket = S} = Connection,
                       State,
                       {request, CorrelationId,
-                       {peer_properties, ClientProperties}},
-                      Rest) ->
+                       {peer_properties, ClientProperties}}) ->
 
     {ok, Product} = application:get_key(rabbit, description),
     {ok, Version} = application:get_key(rabbit, vsn),
@@ -1003,12 +944,11 @@ handle_frame_pre_auth(Transport,
     {Connection#stream_connection{client_properties = ClientProperties,
                                   authentication_state =
                                       peer_properties_exchanged},
-     State, Rest};
+     State};
 handle_frame_pre_auth(Transport,
                       #stream_connection{socket = S} = Connection,
                       State,
-                      {request, CorrelationId, sasl_handshake},
-                      Rest) ->
+                      {request, CorrelationId, sasl_handshake}) ->
     Mechanisms = rabbit_stream_utils:auth_mechanisms(S),
     MechanismsFragment =
         lists:foldl(fun(M, Acc) ->
@@ -1028,7 +968,7 @@ handle_frame_pre_auth(Transport,
     FrameSize = byte_size(Frame),
 
     Transport:send(S, [<<FrameSize:32>>, <<Frame/binary>>]),
-    {Connection, State, Rest};
+    {Connection, State};
 handle_frame_pre_auth(Transport,
                       #stream_connection{socket = S,
                                          authentication_state = AuthState0,
@@ -1036,10 +976,9 @@ handle_frame_pre_auth(Transport,
                           Connection0,
                       State,
                       {request, CorrelationId,
-                       {sasl_authenticate, Mechanism, SaslBin}},
-                      Rest) ->
+                       {sasl_authenticate, Mechanism, SaslBin}}) ->
 
-    {Connection1, Rest1} =
+    Connection1 =
         case rabbit_stream_utils:auth_mechanism_to_module(Mechanism, S) of
             {ok, AuthMechanism} ->
                 AuthState =
@@ -1126,7 +1065,7 @@ handle_frame_pre_auth(Transport,
                       CorrelationId:32,
                       FrameFragment/binary>>,
                 frame(Transport, C1, Frame),
-                {C2, Rest};
+                C2;
             {error, _} ->
                 Frame =
                     <<?RESPONSE:1,
@@ -1135,18 +1074,17 @@ handle_frame_pre_auth(Transport,
                       CorrelationId:32,
                       ?RESPONSE_SASL_MECHANISM_NOT_SUPPORTED:16>>,
                 frame(Transport, Connection0, Frame),
-                {Connection0#stream_connection{connection_step = failure}, Rest}
+                Connection0#stream_connection{connection_step = failure}
         end,
 
-    {Connection1, State, Rest1};
+    {Connection1, State};
 handle_frame_pre_auth(_Transport,
                       #stream_connection{helper_sup = SupPid,
                                          socket = Sock,
                                          name = ConnectionName} =
                           Connection,
                       State,
-                      {tune, FrameMax, Heartbeat},
-                      Rest) ->
+                      {tune, FrameMax, Heartbeat}) ->
     rabbit_log:debug("Tuning response ~p ~p ", [FrameMax, Heartbeat]),
     Parent = self(),
     %% sending a message to the main process so the heartbeat frame is sent from this main process
@@ -1172,13 +1110,12 @@ handle_frame_pre_auth(_Transport,
                                   frame_max = FrameMax,
                                   heartbeat = Heartbeat,
                                   heartbeater = Heartbeater},
-     State, Rest};
+     State};
 handle_frame_pre_auth(Transport,
                       #stream_connection{user = User, socket = S} = Connection,
                       State,
                       {request, CorrelationId,
-                       {open, VirtualHost}},
-                      Rest) ->
+                       {open, VirtualHost}}) ->
     %% FIXME enforce connection limit (see rabbit_reader:is_over_connection_limit/2)
     {Connection1, Frame} =
         try
@@ -1206,20 +1143,17 @@ handle_frame_pre_auth(Transport,
         end,
 
     frame(Transport, Connection1, Frame),
-
-    {Connection1, State, Rest};
+    {Connection1, State};
 handle_frame_pre_auth(_Transport,
                       Connection,
                       State,
-                      heartbeat,
-                      Rest) ->
+                      heartbeat) ->
     rabbit_log:info("Received heartbeat frame pre auth~n"),
-    {Connection, State, Rest};
-handle_frame_pre_auth(_Transport, Connection, State, Command, Rest) ->
-    rabbit_log:warning("unknown command ~p ~p, closing connection.",
-                       [Command, Rest]),
-    {Connection#stream_connection{connection_step = failure}, State,
-     Rest}.
+    {Connection, State};
+handle_frame_pre_auth(_Transport, Connection, State, Command) ->
+    rabbit_log:warning("unknown command ~w, closing connection.",
+                       [Command]),
+    {Connection#stream_connection{connection_step = failure}, State}.
 
 auth_fail(Username, Msg, Args, Connection, ConnectionState) ->
     notify_auth_result(Username,
@@ -1257,8 +1191,7 @@ handle_frame_post_auth(Transport,
                        #stream_connection{resource_alarm = true} = Connection0,
                        State,
                        {request, CorrelationId,
-                        {declare_publisher, PublisherId, _WriterRef, Stream}},
-                       Rest) ->
+                        {declare_publisher, PublisherId, _WriterRef, Stream}}) ->
     rabbit_log:info("Cannot create publisher ~p on stream ~p, connection "
                     "is blocked because of resource alarm",
                     [PublisherId, Stream]),
@@ -1267,7 +1200,7 @@ handle_frame_post_auth(Transport,
              ?COMMAND_DECLARE_PUBLISHER,
              CorrelationId,
              ?RESPONSE_CODE_PRECONDITION_FAILED),
-    {Connection0, State, Rest};
+    {Connection0, State};
 handle_frame_post_auth(Transport,
                        #stream_connection{user = User,
                                           publishers = Publishers0,
@@ -1276,8 +1209,7 @@ handle_frame_post_auth(Transport,
                            Connection0,
                        State,
                        {request, CorrelationId,
-                        {declare_publisher, PublisherId, WriterRef, Stream}},
-                       Rest) ->
+                        {declare_publisher, PublisherId, WriterRef, Stream}}) ->
     case rabbit_stream_utils:check_write_permitted(stream_r(Stream,
                                                             Connection0),
                                                    User, #{})
@@ -1294,7 +1226,7 @@ handle_frame_post_auth(Transport,
                                      ?COMMAND_DECLARE_PUBLISHER,
                                      CorrelationId,
                                      ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST),
-                            {Connection0, State, Rest};
+                            {Connection0, State};
                         {ClusterLeader,
                          #stream_connection{publishers = Publishers0,
                                             publisher_to_ids = RefIds0} =
@@ -1332,7 +1264,7 @@ handle_frame_post_auth(Transport,
                                                                                 Publisher},
                                                            publisher_to_ids =
                                                                RefIds1},
-                             State, Rest}
+                             State}
                     end;
                 {_, _} ->
                     response(Transport,
@@ -1340,7 +1272,7 @@ handle_frame_post_auth(Transport,
                              ?COMMAND_DECLARE_PUBLISHER,
                              CorrelationId,
                              ?RESPONSE_CODE_PRECONDITION_FAILED),
-                    {Connection0, State, Rest}
+                    {Connection0, State}
             end;
         error ->
             response(Transport,
@@ -1348,7 +1280,7 @@ handle_frame_post_auth(Transport,
                      ?COMMAND_DECLARE_PUBLISHER,
                      CorrelationId,
                      ?RESPONSE_CODE_ACCESS_REFUSED),
-            {Connection0, State, Rest}
+            {Connection0, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
@@ -1358,8 +1290,7 @@ handle_frame_post_auth(Transport,
                                           publishers = Publishers} =
                            Connection,
                        State,
-                       {publish, PublisherId, MessageCount, Messages},
-                       Rest) ->
+                       {publish, PublisherId, MessageCount, Messages}) ->
     case Publishers of
         #{PublisherId := Publisher} ->
             #publisher{stream = Stream,
@@ -1383,7 +1314,7 @@ handle_frame_post_auth(Transport,
                                                        PublisherId,
                                                        Messages),
                     sub_credits(Credits, MessageCount),
-                    {Connection, State, Rest};
+                    {Connection, State};
                 error ->
                     FrameSize = 2 + 2 + 1 + 4 + (8 + 2) * MessageCount,
                     Details =
@@ -1399,7 +1330,7 @@ handle_frame_post_auth(Transport,
                                       MessageCount:32,
                                       Details/binary>>]),
                     increase_messages_errored(Counters, MessageCount),
-                    {Connection, State, Rest}
+                    {Connection, State}
             end;
         _ ->
             FrameSize = 2 + 2 + 1 + 4 + (8 + 2) * MessageCount,
@@ -1415,7 +1346,7 @@ handle_frame_post_auth(Transport,
                               PublisherId:8,
                               MessageCount:32,
                               Details/binary>>]),
-            {Connection, State, Rest}
+            {Connection, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
@@ -1424,8 +1355,7 @@ handle_frame_post_auth(Transport,
                            Connection,
                        State,
                        {request, CorrelationId,
-                        {query_publisher_sequence, Reference, Stream}},
-                       Rest) ->
+                        {query_publisher_sequence, Reference, Stream}}) ->
     FrameSize = ?RESPONSE_FRAME_SIZE + 8,
     {ResponseCode, Sequence} =
         case rabbit_stream_utils:check_read_permitted(#resource{name = Stream,
@@ -1461,15 +1391,14 @@ handle_frame_post_auth(Transport,
                     <<CorrelationId:32>>,
                     <<ResponseCode:16>>,
                     <<Sequence:64>>]),
-    {Connection, State, Rest};
+    {Connection, State};
 handle_frame_post_auth(Transport,
                        #stream_connection{publishers = Publishers,
                                           publisher_to_ids = PubToIds} =
                            Connection0,
                        State,
                        {request, CorrelationId,
-                        {delete_publisher, PublisherId}},
-                       Rest) ->
+                        {delete_publisher, PublisherId}}) ->
     case Publishers of
         #{PublisherId := #publisher{stream = Stream, reference = Ref}} ->
             Connection1 =
@@ -1490,14 +1419,14 @@ handle_frame_post_auth(Transport,
                                                     stream_r(Stream,
                                                              Connection2),
                                                     PublisherId),
-            {Connection2, State, Rest};
+            {Connection2, State};
         _ ->
             response(Transport,
                      Connection0,
                      ?COMMAND_DELETE_PUBLISHER,
                      CorrelationId,
                      ?RESPONSE_CODE_PUBLISHER_DOES_NOT_EXIST),
-            {Connection0, State, Rest}
+            {Connection0, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = Socket,
@@ -1510,8 +1439,7 @@ handle_frame_post_auth(Transport,
                        #stream_connection_state{consumers = Consumers} = State,
 
                        {request, CorrelationId,
-                        {subscribe, SubscriptionId, Stream, OffsetSpec, Credit}},
-                       Rest) ->
+                        {subscribe, SubscriptionId, Stream, OffsetSpec, Credit}}) ->
     %% FIXME check the max number of subs is not reached already
     case rabbit_stream_utils:check_read_permitted(#resource{name = Stream,
                                                             kind = queue,
@@ -1528,14 +1456,14 @@ handle_frame_post_auth(Transport,
                              ?COMMAND_SUBSCRIBE,
                              CorrelationId,
                              ?RESPONSE_CODE_STREAM_NOT_AVAILABLE),
-                    {Connection, State, Rest};
+                    {Connection, State};
                 {error, not_found} ->
                     response(Transport,
                              Connection,
                              ?COMMAND_SUBSCRIBE,
                              CorrelationId,
                              ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST),
-                    {Connection, State, Rest};
+                    {Connection, State};
                 {ok, LocalMemberPid} ->
                     case subscription_exists(StreamSubscriptions,
                                              SubscriptionId)
@@ -1546,7 +1474,7 @@ handle_frame_post_auth(Transport,
                                      ?COMMAND_SUBSCRIBE,
                                      CorrelationId,
                                      ?RESPONSE_CODE_SUBSCRIPTION_ID_ALREADY_EXISTS),
-                            {Connection, State, Rest};
+                            {Connection, State};
                         false ->
                             rabbit_log:info("Creating subscription ~p to ~p, with offset specificat"
                                             "ion ~p",
@@ -1624,25 +1552,22 @@ handle_frame_post_auth(Transport,
                                                                =
                                                                StreamSubscriptions1},
                              State#stream_connection_state{consumers =
-                                                               Consumers1},
-                             Rest}
+                                                               Consumers1}}
                     end
             end;
         error ->
             response(Transport,
                      Connection,
-                     ?COMMAND_SUBSCRIBE,
-                     CorrelationId,
+                     ?COMMAND_SUBSCRIBE, CorrelationId,
                      ?RESPONSE_CODE_ACCESS_REFUSED),
-            {Connection, State, Rest}
+            {Connection, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
                                           send_file_oct = SendFileOct} =
                            Connection,
                        #stream_connection_state{consumers = Consumers} = State,
-                       {credit, SubscriptionId, Credit},
-                       Rest) ->
+                       {credit, SubscriptionId, Credit}) ->
     case Consumers of
         #{SubscriptionId := Consumer} ->
             #consumer{credit = AvailableCredit} = Consumer,
@@ -1665,7 +1590,7 @@ handle_frame_post_auth(Transport,
                           SubscriptionId:8>>,
                     FrameSize = byte_size(Frame),
                     Transport:send(S, [<<FrameSize:32>>, Frame]),
-                    {Connection1, State1, Rest};
+                    {Connection1, State1};
                 {{segment, Segment1}, {credit, Credit1}} ->
                     Consumer1 =
                         Consumer#consumer{segment = Segment1, credit = Credit1},
@@ -1673,8 +1598,7 @@ handle_frame_post_auth(Transport,
                      State#stream_connection_state{consumers =
                                                        Consumers#{SubscriptionId
                                                                       =>
-                                                                      Consumer1}},
-                     Rest}
+                                                                      Consumer1}}}
             end;
         _ ->
             rabbit_log:warning("Giving credit to unknown subscription: ~p",
@@ -1687,15 +1611,14 @@ handle_frame_post_auth(Transport,
                   SubscriptionId:8>>,
             FrameSize = byte_size(Frame),
             Transport:send(S, [<<FrameSize:32>>, Frame]),
-            {Connection, State, Rest}
+            {Connection, State}
     end;
 handle_frame_post_auth(_Transport,
                        #stream_connection{virtual_host = VirtualHost,
                                           user = User} =
                            Connection,
                        State,
-                       {commit_offset, Reference, Stream, Offset},
-                       Rest) ->
+                       {commit_offset, Reference, Stream, Offset}) ->
     case rabbit_stream_utils:check_write_permitted(#resource{name =
                                                                  Stream,
                                                              kind = queue,
@@ -1709,21 +1632,15 @@ handle_frame_post_auth(_Transport,
                     rabbit_log:warning("Could not find leader to commit offset on ~p",
                                        [Stream]),
                     %% FIXME commit offset is fire-and-forget, so no response even if error, change this?
-                    {Connection, State, Rest};
-                % undefined ->
-                %     rabbit_log:warning("Could not find leader (undefined) to commit offset "
-                %                        "on ~p",
-                %                        [Stream]),
-                %     %% FIXME commit offset is fire-and-forget, so no response even if error, change this?
-                %     {Connection, State, Rest};
+                    {Connection, State};
                 {ClusterLeader, Connection1} ->
                     osiris:write_tracking(ClusterLeader, Reference, Offset),
-                    {Connection1, State, Rest}
+                    {Connection1, State}
             end;
         error ->
             %% FIXME commit offset is fire-and-forget, so no response even if error, change this?
             rabbit_log:info("Not authorized to commit offset on ~p", [Stream]),
-            {Connection, State, Rest}
+            {Connection, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
@@ -1732,8 +1649,7 @@ handle_frame_post_auth(Transport,
                            Connection0,
                        State,
                        {request, CorrelationId,
-                        {query_offset, Reference, Stream}},
-                       Rest) ->
+                        {query_offset, Reference, Stream}}) ->
     FrameSize = ?RESPONSE_FRAME_SIZE + 8,
     {ResponseCode, Offset, Connection1} =
         case rabbit_stream_utils:check_read_permitted(#resource{name = Stream,
@@ -1768,15 +1684,14 @@ handle_frame_post_auth(Transport,
                     <<CorrelationId:32>>,
                     <<ResponseCode:16>>,
                     <<Offset:64>>]),
-    {Connection1, State, Rest};
+    {Connection1, State};
 handle_frame_post_auth(Transport,
                        #stream_connection{stream_subscriptions =
                                               StreamSubscriptions} =
                            Connection,
                        #stream_connection_state{} = State,
                        {request, CorrelationId,
-                        {unsubscribe, SubscriptionId}},
-                       Rest) ->
+                        {unsubscribe, SubscriptionId}}) ->
     case subscription_exists(StreamSubscriptions, SubscriptionId) of
         false ->
             response(Transport,
@@ -1784,7 +1699,7 @@ handle_frame_post_auth(Transport,
                      ?COMMAND_UNSUBSCRIBE,
                      CorrelationId,
                      ?RESPONSE_CODE_SUBSCRIPTION_ID_DOES_NOT_EXIST),
-            {Connection, State, Rest};
+            {Connection, State};
         true ->
             {Connection1, State1} =
                 remove_subscription(SubscriptionId, Connection, State),
@@ -1792,7 +1707,7 @@ handle_frame_post_auth(Transport,
                         Connection,
                         ?COMMAND_UNSUBSCRIBE,
                         CorrelationId),
-            {Connection1, State1, Rest}
+            {Connection1, State1}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{virtual_host = VirtualHost,
@@ -1802,8 +1717,7 @@ handle_frame_post_auth(Transport,
                            Connection,
                        State,
                        {request, CorrelationId,
-                        {create_stream, Stream, Arguments}},
-                       Rest) ->
+                        {create_stream, Stream, Arguments}}) ->
     case rabbit_stream_utils:enforce_correct_stream_name(Stream) of
         {ok, StreamName} ->
             case rabbit_stream_utils:check_configure_permitted(#resource{name =
@@ -1831,28 +1745,28 @@ handle_frame_post_auth(Transport,
                                         Connection,
                                         ?COMMAND_CREATE_STREAM,
                                         CorrelationId),
-                            {Connection, State, Rest};
+                            {Connection, State};
                         {error, validation_failed} ->
                             response(Transport,
                                      Connection,
                                      ?COMMAND_CREATE_STREAM,
                                      CorrelationId,
                                      ?RESPONSE_CODE_PRECONDITION_FAILED),
-                            {Connection, State, Rest};
+                            {Connection, State};
                         {error, reference_already_exists} ->
                             response(Transport,
                                      Connection,
                                      ?COMMAND_CREATE_STREAM,
                                      CorrelationId,
                                      ?RESPONSE_CODE_STREAM_ALREADY_EXISTS),
-                            {Connection, State, Rest};
+                            {Connection, State};
                         {error, _} ->
                             response(Transport,
                                      Connection,
                                      ?COMMAND_CREATE_STREAM,
                                      CorrelationId,
                                      ?RESPONSE_CODE_INTERNAL_ERROR),
-                            {Connection, State, Rest}
+                            {Connection, State}
                     end;
                 error ->
                     response(Transport,
@@ -1860,7 +1774,7 @@ handle_frame_post_auth(Transport,
                              ?COMMAND_CREATE_STREAM,
                              CorrelationId,
                              ?RESPONSE_CODE_ACCESS_REFUSED),
-                    {Connection, State, Rest}
+                    {Connection, State}
             end;
         _ ->
             response(Transport,
@@ -1868,7 +1782,7 @@ handle_frame_post_auth(Transport,
                      ?COMMAND_CREATE_STREAM,
                      CorrelationId,
                      ?RESPONSE_CODE_PRECONDITION_FAILED),
-            {Connection, State, Rest}
+            {Connection, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
@@ -1879,8 +1793,7 @@ handle_frame_post_auth(Transport,
                            Connection,
                        State,
                        {request, CorrelationId,
-                        {delete_stream, Stream}},
-                       Rest) ->
+                        {delete_stream, Stream}}) ->
     case rabbit_stream_utils:check_configure_permitted(#resource{name =
                                                                      Stream,
                                                                  kind = queue,
@@ -1916,14 +1829,14 @@ handle_frame_post_auth(Transport,
                             {not_cleaned, SameConnection, SameState} ->
                                 {SameConnection, SameState}
                         end,
-                    {Connection1, State1, Rest};
+                    {Connection1, State1};
                 {error, reference_not_found} ->
                     response(Transport,
                              Connection,
                              ?COMMAND_DELETE_STREAM,
                              CorrelationId,
                              ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST),
-                    {Connection, State, Rest}
+                    {Connection, State}
             end;
         error ->
             response(Transport,
@@ -1931,15 +1844,14 @@ handle_frame_post_auth(Transport,
                      ?COMMAND_DELETE_STREAM,
                      CorrelationId,
                      ?RESPONSE_CODE_ACCESS_REFUSED),
-            {Connection, State, Rest}
+            {Connection, State}
     end;
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
                                           virtual_host = VirtualHost} =
                            Connection,
                        State,
-                       {request, CorrelationId, {metadata, Streams}},
-                       Rest) ->
+                       {request, CorrelationId, {metadata, Streams}}) ->
     StreamCount = length(Streams),
 
     Topology =
@@ -2073,15 +1985,14 @@ handle_frame_post_auth(Transport,
           MetadataBin/binary>>,
     FrameSize = byte_size(Frame),
     Transport:send(S, <<FrameSize:32, Frame/binary>>),
-    {Connection, State, Rest};
+    {Connection, State};
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
                                           virtual_host = VirtualHost} =
                            Connection,
                        State,
                        {request, CorrelationId,
-                        {route, RoutingKey, SuperStream}},
-                       Rest) ->
+                        {route, RoutingKey, SuperStream}}) ->
     {ResponseCode, StreamBin} =
         case rabbit_stream_manager:route(RoutingKey, VirtualHost, SuperStream)
         of
@@ -2103,15 +2014,14 @@ handle_frame_post_auth(Transport,
           StreamBin/binary>>,
     FrameSize = byte_size(Frame),
     Transport:send(S, <<FrameSize:32, Frame/binary>>),
-    {Connection, State, Rest};
+    {Connection, State};
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
                                           virtual_host = VirtualHost} =
                            Connection,
                        State,
                        {request, CorrelationId,
-                        {partitions, SuperStream}},
-                       Rest) ->
+                        {partitions, SuperStream}}) ->
     {ResponseCode, PartitionsBin} =
         case rabbit_stream_manager:partitions(VirtualHost, SuperStream) of
             {ok, []} ->
@@ -2137,13 +2047,12 @@ handle_frame_post_auth(Transport,
           PartitionsBin/binary>>,
     FrameSize = byte_size(Frame),
     Transport:send(S, <<FrameSize:32, Frame/binary>>),
-    {Connection, State, Rest};
+    {Connection, State};
 handle_frame_post_auth(Transport,
                        Connection,
                        State,
                        {request, CorrelationId,
-                        {close, ClosingCode, ClosingReason}},
-                       _Rest) ->
+                        {close, ClosingCode, ClosingReason}}) ->
     rabbit_log:info("Received close command ~p ~p",
                     [ClosingCode, ClosingReason]),
     Frame =
@@ -2153,18 +2062,16 @@ handle_frame_post_auth(Transport,
           CorrelationId:32,
           ?RESPONSE_CODE_OK:16>>,
     frame(Transport, Connection, Frame),
-    {Connection#stream_connection{connection_step = closing}, State,
-     <<>>}; %% we ignore any subsequent frames
+    {Connection#stream_connection{connection_step = closing}, State}; %% we ignore any subsequent frames
 handle_frame_post_auth(_Transport,
                        Connection,
                        State,
-                       heartbeat,
-                       Rest) ->
+                       heartbeat) ->
     rabbit_log:info("Received heartbeat frame post auth~n"),
-    {Connection, State, Rest};
-handle_frame_post_auth(Transport, Connection, State, Command, Rest) ->
-    rabbit_log:warning("unknown command ~p ~p, sending close command.",
-                       [Command, Rest]),
+    {Connection, State};
+handle_frame_post_auth(Transport, Connection, State, Command) ->
+    rabbit_log:warning("unknown command ~p , sending close command.",
+                       [Command]),
     CloseReason = <<"unknown frame">>,
     CloseReasonLength = byte_size(CloseReason),
     CloseFrame =
@@ -2176,8 +2083,7 @@ handle_frame_post_auth(Transport, Connection, State, Command, Rest) ->
           CloseReasonLength:16,
           CloseReason:CloseReasonLength/binary>>,
     frame(Transport, Connection, CloseFrame),
-    {Connection#stream_connection{connection_step = close_sent}, State,
-     Rest}.
+    {Connection#stream_connection{connection_step = close_sent}, State}.
 
 notify_connection_closed(#stream_connection{name = Name,
                                             publishers = Publishers} =
@@ -2206,21 +2112,18 @@ notify_connection_closed(#stream_connection{name = Name,
 handle_frame_post_close(_Transport,
                         Connection,
                         State,
-                        {response, _CorrelationId, {close, _Code}},
-                        Rest) ->
+                        {response, _CorrelationId, {close, _Code}}) ->
     rabbit_log:info("Received close confirmation~n"),
-    {Connection#stream_connection{connection_step = closing_done}, State,
-     Rest};
+    {Connection#stream_connection{connection_step = closing_done}, State};
 handle_frame_post_close(_Transport,
                         Connection,
                         State,
-                        heartbeat,
-                        Rest) ->
+                        heartbeat) ->
     rabbit_log:info("Received heartbeat command post close~n"),
-    {Connection, State, Rest};
-handle_frame_post_close(_Transport, Connection, State, Command, Rest) ->
-    rabbit_log:warning("ignored command on close ~p ~p.", [Command, Rest]),
-    {Connection, State, Rest}.
+    {Connection, State};
+handle_frame_post_close(_Transport, Connection, State, Command) ->
+    rabbit_log:warning("ignored command on close ~p .", [Command]),
+    {Connection, State}.
 
 stream_r(Stream, #stream_connection{virtual_host = VHost}) ->
     #resource{name = Stream,

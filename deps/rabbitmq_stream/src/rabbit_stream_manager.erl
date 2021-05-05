@@ -75,7 +75,7 @@ topology(VirtualHost, Stream) ->
     gen_server:call(?MODULE, {topology, VirtualHost, Stream}).
 
 -spec route(binary(), binary(), binary()) ->
-               {ok, binary()} | {error, stream_not_found}.
+               {ok, binary() | no_route} | {error, stream_not_found}.
 route(RoutingKey, VirtualHost, SuperStream) ->
     gen_server:call(?MODULE,
                     {route, RoutingKey, VirtualHost, SuperStream}).
