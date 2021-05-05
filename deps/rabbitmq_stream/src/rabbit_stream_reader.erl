@@ -482,6 +482,7 @@ listen_loop_post_auth(Transport,
                     State2 =
                         case Blocked of
                             true ->
+                                        rabbit_log:info("Is blocked", []),
                                 case should_unblock(Connection, Configuration)
                                 of
                                     true ->
@@ -499,6 +500,7 @@ listen_loop_post_auth(Transport,
                                         Transport:setopts(S, [{active, once}]),
                                         State1;
                                     false ->
+                                        rabbit_log:info("Has no credits", []),
                                         ok =
                                             rabbit_heartbeat:pause_monitor(Heartbeater),
                                         State1#stream_connection_state{blocked =
@@ -854,11 +856,9 @@ handle_inbound_data(Transport,
                     HandleFrameFun) ->
     case rabbit_stream_core:incoming_data(Data, CoreState0) of
         {CoreState, []} ->
-            % rabbit_log:info("NO FRAMES ", []),
             {Connection,
              State#stream_connection_state{data = CoreState}};
         {CoreState, Commands} ->
-            % rabbit_log:info("FRAMES ~w", [length(Frames)]),
             {Connection1, State1, _} =
             lists:foldl(
               fun (Command, {C, S, R}) ->
@@ -866,11 +866,7 @@ handle_inbound_data(Transport,
               end, {Connection,
                     State#stream_connection_state{data = CoreState},
                     <<>>}, Commands),
-            handle_inbound_data(Transport,
-                                Connection1,
-                                State1,
-                                <<>>,
-                                HandleFrameFun)
+            {Connection1, State1}
     end.
 
 % handle_inbound_data(_Transport,

@@ -147,10 +147,17 @@ incoming_data(<<Size:32, Rem/binary>>,
      parse_frames(Frames)};
 incoming_data(Data,
               #?MODULE{frames = Frames,
+                       data = undefined} = State) when byte_size(Data) < 4 ->
+    %% not enough data to even know the size required
+    %% just stash binary and hit last clause next
+    {State#?MODULE{frames = [], data = Data},
+     parse_frames(Frames)};
+incoming_data(Data,
+              #?MODULE{frames = Frames,
                        data = {Size, Partial}} = State) ->
     case Data of
-        <<Data:Size/binary, Rem/binary>> ->
-            incoming_data(Rem, State#?MODULE{frames = [append_data(Partial, Data)
+        <<Part:Size/binary, Rem/binary>> ->
+            incoming_data(Rem, State#?MODULE{frames = [append_data(Partial, Part)
                                                        | Frames],
                                              data = undefined});
         Rem ->
@@ -482,7 +489,3 @@ parse_command_id(?COMMAND_CLOSE) -> close.
 % command_id(delete_stream) -> ?COMMAND_DELETE_STREAM;
 % command_id(open) -> ?COMMAND_OPEN;
 % command_id(close) -> ?COMMAND_CLOSE.
-
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
--endif.
