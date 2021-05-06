@@ -732,14 +732,11 @@ bq_queue_recover1(Config) ->
     {Recovered, []} = rabbit_amqqueue:recover(?VHOST),
     rabbit_amqqueue:start(Recovered),
     {ok, Limiter} = rabbit_limiter:start_link(no_id),
-%    observer:start(),
-%    timer:sleep(1000000),
     rabbit_amqqueue:with_or_die(
       QName,
       fun (Q1) when ?is_amqqueue(Q1) ->
               QPid1 = amqqueue:get_pid(Q1),
               CountMinusOne = Count - 1,
-              %% @todo For this test to pass the IsDelivered must be set to true during recovery.
               {ok, CountMinusOne, {QName, QPid1, _AckTag, true, _Msg}, _} =
                   rabbit_amqqueue:basic_get(Q1, false, Limiter,
                                             <<"bq_queue_recover1">>, QT),

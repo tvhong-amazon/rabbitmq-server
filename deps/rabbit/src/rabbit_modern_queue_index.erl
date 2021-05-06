@@ -257,7 +257,6 @@ reset_state(State = #mqistate{ queue_name     = Name,
 recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
         ContainsCheckFun, OnSyncFun, _OnSyncMsgFun) ->
     ?DEBUG("~0p ~0p ~0p ~0p ~0p", [Name, Terms, IsMsgStoreClean, ContainsCheckFun, OnSyncFun]),
-    logger:error("recover ~p ~p", [IsMsgStoreClean, Terms]),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = queue_dir(VHostDir, Name),
     State0 = init1(Name, Dir, OnSyncFun),
@@ -290,7 +289,6 @@ recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
     %% recovered we might have marked additional messages as acked as
     %% part of the recovery process.
     State = recover_maybe_advance_ack_marker(State2),
-    logger:error("recover ~p ~p ~p ~p~n~p", [Count, Bytes, IsMsgStoreClean, Terms, State]),
     %% We can now ensure the current segment file is in a good state and return.
     {Count, Bytes, ensure_segment_file(recover, State)}.
 
@@ -395,11 +393,16 @@ recover_write_marker(State, ContainsCheckFun, CountersRef,
                 %%
                 %% @todo rabbit_queue_index marks all messages as delivered
                 %%       when the shutdown was not clean. Should we do the same?
-                {ok, <<1,_:24,Id:16/binary,Size:32/unsigned>>} ->
-                    logger:error("~p ~p", [Id, ContainsCheckFun(Id)]),
+                {ok, <<1,IsDelivered:8,_:16,Id:16/binary,Size:32/unsigned>>} ->
                     NextAcks = case ContainsCheckFun(Id) of
-                        %% Message is in the store.
+                        %% Message is in the store. We mark all those
+                        %% messages as delivered if they were not already
+                        %% (like the old index).
                         true ->
+                            case IsDelivered of
+                                1 -> ok;
+                                0 -> file:pwrite(Fd, Offset + 1, <<1>>)
+                            end,
                             counters:add(CountersRef, ?RECOVER_COUNT, 1),
                             counters:add(CountersRef, ?RECOVER_BYTES, Size),
                             Acks;
@@ -1073,38 +1076,29 @@ queue_index_walker_reader(#resource{ virtual_host = VHost } = Name, Gatherer) ->
     ok = gatherer:finish(Gatherer).
 
 queue_index_walker_segment(F, Gatherer) ->
-try
-    logger:error("queue_index_walker ~p", [F]),
     {ok, Fd} = file:open(F, [read, raw, binary]),
     case file:read(Fd, 21) of
         {ok, <<?MAGIC:32, ?VERSION:8,
                FromSeqId:64/unsigned,
                ToSeqId:64/unsigned>>} ->
             queue_index_walker_segment(Fd, Gatherer, 0, ToSeqId - FromSeqId);
-        _Ret ->
-            logger:error("~p", [_Ret]),
+        _ ->
             %% Invalid segment file. Skip.
             ok
     end,
-    ok = file:close(Fd)
-catch C:E:S ->
-    logger:error("~p:~p:~p", [C,E,S])
-end.
+    ok = file:close(Fd).
 
 queue_index_walker_segment(_, _, N, N) ->
     %% We reached the end of the segment file.
-    logger:error(" ~p END", [N]),
     ok;
 queue_index_walker_segment(Fd, Gatherer, N, Total) ->
     Offset = ?HEADER_SIZE + N * ?ENTRY_SIZE,
     case file:pread(Fd, Offset, 20) of
         %% We found an ack, skip the entry.
         {ok, <<2,_/bits>>} ->
-            logger:error(" ~p ack", [N]),
             queue_index_walker_segment(Fd, Gatherer, N + 1, Total);
         %% We found a non-ack persistent entry. Gather it.
         {ok, <<1,_,1,_,Id:16/binary>>} ->
-%            logger:error(" ~p GOOD", [N]),
             gatherer:sync_in(Gatherer, {Id, 1}),
             queue_index_walker_segment(Fd, Gatherer, N + 1, Total);
         %% We found a non-ack transient entry. Skip it. It will
@@ -1112,14 +1106,12 @@ queue_index_walker_segment(Fd, Gatherer, N, Total) ->
         %%
         %% @todo It might save us some cycles if we just did it here.
         {ok, <<1,_/bits>>} ->
-            logger:error(" ~p transient", [N]),
             queue_index_walker_segment(Fd, Gatherer, N + 1, Total);
         %% We found a non-entry. This is the end of the segment file.
         %%
         %% @todo It might also be a hole, but I'm not sure it is
         %%       even possible to have holes. See comments in recover.
-        Other ->
-            logger:error(" ~p ~p end", [N, Other]),
+        {ok, <<0,_/bits>>} ->
             ok
     end.
 

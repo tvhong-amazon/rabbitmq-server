@@ -883,7 +883,6 @@ handle_cast({write, CRef, MsgId, Flow},
             State = #msstate { cur_file_cache_ets = CurFileCacheEts,
                                clients            = Clients,
                                credit_disc_bound  = CreditDiscBound }) ->
-logger:error("msg_store write ~p", [MsgId]),
     case Flow of
         flow   -> {CPid, _, _} = maps:get(CRef, Clients),
                   %% We are going to process a message sent by the
@@ -1762,7 +1761,6 @@ build_index_worker(Gatherer, State = #msstate { dir = Dir },
                      [form_filename(Dir, FileName), length(Files)]),
     {ok, Messages, FileSize} =
         scan_file_for_valid_messages(Dir, FileName),
-    logger:error("build_index_worker ~p~n~p", [Messages, FileSize]),
     {ValidMessages, ValidTotalSize} =
         lists:foldl(
           fun (Obj = {MsgId, TotalSize, Offset}, {VMAcc, VTSAcc}) ->
@@ -1777,7 +1775,6 @@ build_index_worker(Gatherer, State = #msstate { dir = Dir },
                           {VMAcc, VTSAcc}
                   end
           end, {[], 0}, Messages),
-    logger:error("build_index_worker valid ~p~n~p", [ValidMessages, ValidTotalSize]),
     {Right, FileSize1} =
         case Files of
             %% if it's the last file, we'll truncate to remove any
@@ -1827,7 +1824,6 @@ reduce_index(Gatherer, LastFile,
                          [#file_summary { file_size = FileSize }] -> FileSize
                      end,
             Ret={Offset, State #msstate { current_file = LastFile }},
-            logger:error("reduce_index ~p", [Ret]),
             Ret;
         {value, #file_summary { valid_total_size = ValidTotalSize,
                                 file_size = FileSize } = FileSummary} ->
