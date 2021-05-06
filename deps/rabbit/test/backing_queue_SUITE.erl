@@ -664,7 +664,7 @@ bq_queue_index_props1(_Config) ->
               MsgId = rabbit_guid:gen(),
               Props = #message_properties{expiry=12345, size = 10},
               Qi1 = rabbit_queue_index:publish(
-                      MsgId, 1, Props, true, infinity, Qi0),
+                      MsgId, 1, Props, true, false, infinity, Qi0),
               {[{MsgId, 1, Props, _, _}], Qi2} =
                   rabbit_queue_index:read(1, 2, Qi1),
               Qi2
@@ -732,11 +732,14 @@ bq_queue_recover1(Config) ->
     {Recovered, []} = rabbit_amqqueue:recover(?VHOST),
     rabbit_amqqueue:start(Recovered),
     {ok, Limiter} = rabbit_limiter:start_link(no_id),
+%    observer:start(),
+%    timer:sleep(1000000),
     rabbit_amqqueue:with_or_die(
       QName,
       fun (Q1) when ?is_amqqueue(Q1) ->
               QPid1 = amqqueue:get_pid(Q1),
               CountMinusOne = Count - 1,
+              %% @todo For this test to pass the IsDelivered must be set to true during recovery.
               {ok, CountMinusOne, {QName, QPid1, _AckTag, true, _Msg}, _} =
                   rabbit_amqqueue:basic_get(Q1, false, Limiter,
                                             <<"bq_queue_recover1">>, QT),
@@ -1338,7 +1341,7 @@ queue_index_publish(SeqIds, Persistent, Qi) ->
                   MsgId = rabbit_guid:gen(),
                   QiM = rabbit_queue_index:publish(
                           MsgId, SeqId, #message_properties{size = 10},
-                          Persistent, infinity, QiN),
+                          Persistent, false, infinity, QiN),
                   ok = rabbit_msg_store:write(MsgId, MsgId, MSCState),
                   {QiM, [{SeqId, MsgId} | SeqIdsMsgIdsAcc]}
           end, {Qi, []}, SeqIds),

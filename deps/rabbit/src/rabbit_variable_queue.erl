@@ -1215,7 +1215,7 @@ beta_msg_status({Msg = #basic_message{id = MsgId},
     MS0 = beta_msg_status0(SeqId, MsgProps, IsPersistent, IsDelivered),
     MS0#msg_status{msg_id       = MsgId,
                    msg          = Msg,
-                   persist_to   = queue_index,
+                   persist_to   = msg_store, % queue_index,
                    msg_in_store = false};
 
 beta_msg_status({MsgId, SeqId, MsgProps, IsPersistent, IsDelivered}) ->
@@ -2018,41 +2018,42 @@ maybe_prepare_write_to_disk(ForceMsg, ForceIndex, MsgStatus, State) ->
     {MsgStatus1, State1} = maybe_write_msg_to_disk(ForceMsg, MsgStatus, State),
     maybe_batch_write_index_to_disk(ForceIndex, MsgStatus1, State1).
 
-determine_persist_to(#basic_message{
-                        content = #content{properties     = Props,
-                                           properties_bin = PropsBin}},
-                     #message_properties{size = BodySize},
-                     IndexMaxSize) ->
-    %% The >= is so that you can set the env to 0 and never persist
-    %% to the index.
-    %%
-    %% We want this to be fast, so we avoid size(term_to_binary())
-    %% here, or using the term size estimation from truncate.erl, both
-    %% of which are too slow. So instead, if the message body size
-    %% goes over the limit then we avoid any other checks.
-    %%
-    %% If it doesn't we need to decide if the properties will push
-    %% it past the limit. If we have the encoded properties (usual
-    %% case) we can just check their size. If we don't (message came
-    %% via the direct client), we make a guess based on the number of
-    %% headers.
-    case BodySize >= IndexMaxSize of
-        true  -> msg_store;
-        false -> Est = case is_binary(PropsBin) of
-                           true  -> BodySize + size(PropsBin);
-                           false -> #'P_basic'{headers = Hs} = Props,
-                                    case Hs of
-                                        undefined -> 0;
-                                        _         -> length(Hs)
-                                    end * ?HEADER_GUESS_SIZE + BodySize
-                       end,
-                 case Est >= IndexMaxSize of
-                     true  -> msg_store;
-                     false -> queue_index
-                 end
-    end.
+determine_persist_to(_, _, _) -> msg_store.
+%determine_persist_to(#basic_message{
+%                        content = #content{properties     = Props,
+%                                           properties_bin = PropsBin}},
+%                     #message_properties{size = BodySize},
+%                     IndexMaxSize) ->
+%    %% The >= is so that you can set the env to 0 and never persist
+%    %% to the index.
+%    %%
+%    %% We want this to be fast, so we avoid size(term_to_binary())
+%    %% here, or using the term size estimation from truncate.erl, both
+%    %% of which are too slow. So instead, if the message body size
+%    %% goes over the limit then we avoid any other checks.
+%    %%
+%    %% If it doesn't we need to decide if the properties will push
+%    %% it past the limit. If we have the encoded properties (usual
+%    %% case) we can just check their size. If we don't (message came
+%    %% via the direct client), we make a guess based on the number of
+%    %% headers.
+%    case BodySize >= IndexMaxSize of
+%        true  -> msg_store;
+%        false -> Est = case is_binary(PropsBin) of
+%                           true  -> BodySize + size(PropsBin);
+%                           false -> #'P_basic'{headers = Hs} = Props,
+%                                    case Hs of
+%                                        undefined -> 0;
+%                                        _         -> length(Hs)
+%                                    end * ?HEADER_GUESS_SIZE + BodySize
+%                       end,
+%                 case Est >= IndexMaxSize of
+%                     true  -> msg_store;
+%                     false -> queue_index
+%                 end
+%    end.
 
-persist_to(#msg_status{persist_to = _To}) -> msg_store. % To.
+persist_to(#msg_status{persist_to = To}) -> To.
 
 prepare_to_store(Msg) ->
     Msg#basic_message{

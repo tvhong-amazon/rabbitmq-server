@@ -34,7 +34,7 @@
 -include_lib("kernel/include/file.hrl").
 
 %% Set to true to get an awful lot of debug logs.
--if(false).
+-if(true).
 -define(DEBUG(X,Y), logger:debug("~0p: " ++ X, [?FUNCTION_NAME|Y])).
 -else.
 -define(DEBUG(X,Y), _ = X, _ = Y, ok).
@@ -102,6 +102,8 @@
 %%    %% the read_marker position to the lowest value.
 %%    read_marker = 0 :: seq_id(),
 
+%% @todo This is not needed either because the queue keeps
+%%       the messages that are in transit in its own state.
     %% seq_id() of messages that are in-transit. They
     %% could be in-transit because they have been read
     %% by the queue, or delivered to the consumer.
@@ -255,6 +257,7 @@ reset_state(State = #mqistate{ queue_name     = Name,
 recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
         ContainsCheckFun, OnSyncFun, _OnSyncMsgFun) ->
     ?DEBUG("~0p ~0p ~0p ~0p ~0p", [Name, Terms, IsMsgStoreClean, ContainsCheckFun, OnSyncFun]),
+    logger:error("recover ~p ~p", [IsMsgStoreClean, Terms]),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = queue_dir(VHostDir, Name),
     State0 = init1(Name, Dir, OnSyncFun),
@@ -287,6 +290,7 @@ recover(#resource{ virtual_host = VHost } = Name, Terms, IsMsgStoreClean,
     %% recovered we might have marked additional messages as acked as
     %% part of the recovery process.
     State = recover_maybe_advance_ack_marker(State2),
+    logger:error("recover ~p ~p ~p ~p~n~p", [Count, Bytes, IsMsgStoreClean, Terms, State]),
     %% We can now ensure the current segment file is in a good state and return.
     {Count, Bytes, ensure_segment_file(recover, State)}.
 
@@ -392,6 +396,7 @@ recover_write_marker(State, ContainsCheckFun, CountersRef,
                 %% @todo rabbit_queue_index marks all messages as delivered
                 %%       when the shutdown was not clean. Should we do the same?
                 {ok, <<1,_:24,Id:16/binary,Size:32/unsigned>>} ->
+                    logger:error("~p ~p", [Id, ContainsCheckFun(Id)]),
                     NextAcks = case ContainsCheckFun(Id) of
                         %% Message is in the store.
                         true ->
@@ -490,7 +495,7 @@ delete_and_terminate(State = #mqistate { dir = Dir,
 %% @todo Because we always persist to the msg_store, the MsgOrId argument
 %%       here is always a binary, never a record.
 
-publish(MsgOrId, SeqId, Props, IsPersistent, _IsDelivered, TargetRamCount,
+publish(MsgOrId, SeqId, Props, IsPersistent, IsDelivered, TargetRamCount,
         State0 = #mqistate { write_marker = WriteMarker })
         when SeqId < WriteMarker ->
     ?DEBUG("~0p ~0p ~0p ~0p ~0p ~0p", [MsgOrId, SeqId, Props, IsPersistent, TargetRamCount, State0]),
@@ -504,11 +509,12 @@ publish(MsgOrId, SeqId, Props, IsPersistent, _IsDelivered, TargetRamCount,
     %%       waste of resources if the message already has the flag.
     %% @todo To be honest I don't think we need to... We should
     %%       already have gotten a deliver/2 call for it.
-%    case IsDelivered of
-%        true -> deliver([SeqId], State);
-%        false -> State
-%    end.
-    State;
+
+    %% @todo Maybe do this in pre_publish...
+    case IsDelivered of
+        true -> deliver([SeqId], State);
+        false -> State
+    end;
 
 publish(MsgOrId, SeqId, Props, IsPersistent, IsDelivered, TargetRamCount,
         State0 = #mqistate { write_marker = WriteMarker,
@@ -871,8 +877,9 @@ read(Range, State0 = #mqistate{ write_buffer = WriteBuffer,
     {Reads, State}.
 
 prepare_read(Range, InTransit, Acks) ->
-    RangeList = range_lists:subtract_range(Range, InTransit),
-    ToRead = range_lists:to_list(RangeList),
+%    RangeList = range_lists:subtract_range(Range, InTransit),
+%    ToRead = range_lists:to_list(RangeList),
+    ToRead = range_lists:to_list([Range]),
     ToRead -- Acks.
 
 read_from_buffer([], _, SeqIdsOnDisk, Reads) ->
@@ -895,7 +902,7 @@ read_from_buffer([SeqId|Tail], WriteBuffer, SeqIdsOnDisk, Reads) ->
 
 read_from_disk([], State, Acc) ->
     {Acc, State};
-read_from_disk(SeqIdsToRead0, State0, Acc0) ->
+read_from_disk(SeqIdsToRead0, State0 = #mqistate{ write_buffer = WriteBuffer }, Acc0) ->
     FirstSeqId = hd(SeqIdsToRead0),
     %% We get the highest continuous seq_id() from the same segment file.
     %% If there are more continuous entries we will read them on the
@@ -908,7 +915,7 @@ read_from_disk(SeqIdsToRead0, State0, Acc0) ->
     {ok, EntriesBin} = file:pread(Fd, OffsetForSeqId, ReadSize),
     %% We cons new entries into the Acc and only reverse it when we
     %% are completely done reading new entries.
-    Acc = parse_entries(EntriesBin, FirstSeqId, Acc0),
+    Acc = parse_entries(EntriesBin, FirstSeqId, WriteBuffer, Acc0),
     read_from_disk(SeqIdsToRead, State, Acc).
 
 get_fd(SeqId, State = #mqistate{ fds = OpenFds }) ->
@@ -931,16 +938,16 @@ locate(SeqId, SegmentEntryCount) ->
 %% have already been acked. We do not add them to the Acc in that case, and
 %% as a result we may end up returning less messages than initially expected.
 
-parse_entries(<<>>, _, Acc) ->
+parse_entries(<<>>, _, _, Acc) ->
     Acc;
 parse_entries(<< Status:8,
-                 IsDelivered:8,
+                 IsDelivered0:8,
                  _:7, IsPersistent:1,
                  _:8,
                  Id0:128,
                  Size:32/unsigned,
                  Expiry0:64/unsigned,
-                 Rest/bits >>, SeqId, Acc) ->
+                 Rest/bits >>, SeqId, WriteBuffer, Acc) ->
     %% We skip entries that have already been acked. This may only
     %% happen when we recover from a dirty shutdown.
     case Status of
@@ -954,14 +961,24 @@ parse_entries(<< Status:8,
                 _ -> Expiry0
             end,
             Props = #message_properties{expiry = Expiry, size = Size},
-            %% @todo We need to check if we have a 'deliver' in the write buffer as well.
-            parse_entries(Rest, SeqId + 1, [{Id, SeqId, Props, IsPersistent =:= 1, IsDelivered =:= 1}|Acc]);
+            %% We may have a deliver in the write buffer.
+            IsDelivered = case IsDelivered0 of
+                1 ->
+                    true;
+                0 ->
+                    case WriteBuffer of
+                        #{SeqId := deliver} -> true;
+                        _ -> false
+                    end
+            end,
+            parse_entries(Rest, SeqId + 1, WriteBuffer,
+                          [{Id, SeqId, Props, IsPersistent =:= 1, IsDelivered}|Acc]);
         2 ->
             %% @todo It would be good to keep track of how many "misses"
             %%       we have. We can use it to confirm the correct behavior
             %%       of the module in tests, as well as an occasionally
             %%       useful internal metric. Maybe use counters.
-            parse_entries(Rest, SeqId + 1, Acc)
+            parse_entries(Rest, SeqId + 1, WriteBuffer, Acc)
     end.
 
 %% Mark/remove from transit.
@@ -1020,7 +1037,91 @@ flush(State) ->
 
 start(VHost, DurableQueueNames) ->
     ?DEBUG("~0p ~0p", [VHost, DurableQueueNames]),
-    rabbit_queue_index:start(VHost, DurableQueueNames).
+    %% We replace the queue_index_walker function with our own.
+    %% Everything else remains the same.
+    {OrderedTerms, {_QueueIndexWalkerFun, FunState}} = rabbit_queue_index:start(VHost, DurableQueueNames),
+    {OrderedTerms, {fun queue_index_walker/1, FunState}}.
+
+queue_index_walker({start, DurableQueues}) when is_list(DurableQueues) ->
+    {ok, Gatherer} = gatherer:start_link(),
+    [begin
+         ok = gatherer:fork(Gatherer),
+         ok = worker_pool:submit_async(
+                fun () -> link(Gatherer),
+                          ok = queue_index_walker_reader(QueueName, Gatherer),
+                          unlink(Gatherer),
+                          ok
+                end)
+     end || QueueName <- DurableQueues],
+    queue_index_walker({next, Gatherer});
+
+queue_index_walker({next, Gatherer}) when is_pid(Gatherer) ->
+    timer:sleep(1), %% @todo For some reason things go wrong if I don't do this. I think gatherer might give up too early.
+    case gatherer:out(Gatherer) of
+        empty ->
+            ok = gatherer:stop(Gatherer),
+            finished;
+        {value, {MsgId, Count}} ->
+            {MsgId, Count, {next, Gatherer}}
+    end.
+
+queue_index_walker_reader(#resource{ virtual_host = VHost } = Name, Gatherer) ->
+    VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
+    Dir = queue_dir(VHostDir, Name),
+    SegmentFiles = rabbit_file:wildcard(".*\\" ++ ?SEGMENT_EXTENSION, Dir),
+    _ = [queue_index_walker_segment(filename:join(Dir, F), Gatherer) || F <- SegmentFiles],
+    ok = gatherer:finish(Gatherer).
+
+queue_index_walker_segment(F, Gatherer) ->
+try
+    logger:error("queue_index_walker ~p", [F]),
+    {ok, Fd} = file:open(F, [read, raw, binary]),
+    case file:read(Fd, 21) of
+        {ok, <<?MAGIC:32, ?VERSION:8,
+               FromSeqId:64/unsigned,
+               ToSeqId:64/unsigned>>} ->
+            queue_index_walker_segment(Fd, Gatherer, 0, ToSeqId - FromSeqId);
+        _Ret ->
+            logger:error("~p", [_Ret]),
+            %% Invalid segment file. Skip.
+            ok
+    end,
+    ok = file:close(Fd)
+catch C:E:S ->
+    logger:error("~p:~p:~p", [C,E,S])
+end.
+
+queue_index_walker_segment(_, _, N, N) ->
+    %% We reached the end of the segment file.
+    logger:error(" ~p END", [N]),
+    ok;
+queue_index_walker_segment(Fd, Gatherer, N, Total) ->
+    Offset = ?HEADER_SIZE + N * ?ENTRY_SIZE,
+    case file:pread(Fd, Offset, 20) of
+        %% We found an ack, skip the entry.
+        {ok, <<2,_/bits>>} ->
+            logger:error(" ~p ack", [N]),
+            queue_index_walker_segment(Fd, Gatherer, N + 1, Total);
+        %% We found a non-ack persistent entry. Gather it.
+        {ok, <<1,_,1,_,Id:16/binary>>} ->
+%            logger:error(" ~p GOOD", [N]),
+            gatherer:sync_in(Gatherer, {Id, 1}),
+            queue_index_walker_segment(Fd, Gatherer, N + 1, Total);
+        %% We found a non-ack transient entry. Skip it. It will
+        %% be marked as acked later during the recover phase.
+        %%
+        %% @todo It might save us some cycles if we just did it here.
+        {ok, <<1,_/bits>>} ->
+            logger:error(" ~p transient", [N]),
+            queue_index_walker_segment(Fd, Gatherer, N + 1, Total);
+        %% We found a non-entry. This is the end of the segment file.
+        %%
+        %% @todo It might also be a hole, but I'm not sure it is
+        %%       even possible to have holes. See comments in recover.
+        Other ->
+            logger:error(" ~p ~p end", [N, Other]),
+            ok
+    end.
 
 stop(VHost) ->
     ?DEBUG("~0p", [VHost]),
