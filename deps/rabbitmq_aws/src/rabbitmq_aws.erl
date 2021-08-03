@@ -35,6 +35,9 @@
 
 -include("rabbitmq_aws.hrl").
 
+-define(LINEAR_BACK_OFF_MILLIS, 1000).
+-define(MAX_RETRIES, 10).
+
 %%====================================================================
 %% exported wrapper functions
 %%====================================================================
@@ -543,10 +546,23 @@ ensure_credentials_valid() ->
 %% @end
 api_get_request(Service, Path) ->
   rabbit_log:debug("Invoking AWS request {Service: ~p; Path: ~p}...", [Service, Path]),
+  api_get_request_with_retries(Service, Path, ?MAX_RETRIES, ?LINEAR_BACK_OFF_MILLIS).
+
+-spec api_get_request_with_retries(string(), path(), integer(), integer()) -> result().
+%% @doc Invoke an API call to an AWS service with retries.
+%% @end
+api_get_request_with_retries(Service, Path, Retries, DelayIntervalMillis) ->
   ensure_credentials_valid(),
   case get(Service, Path) of
-    {ok, {_Headers, Payload}} -> rabbit_log:debug("AWS request: ~s~nResponse: ~p", [Path, Payload]),
-                                 {ok, Payload};
-    {error, {credentials, _}} -> {error, credentials};
-    {error, Message, _}       -> {error, Message}
+    {ok, {_Headers, Payload}} ->
+      rabbit_log:debug("AWS request: ~s~nResponse: ~p", [Path, Payload]),
+      {ok, Payload};
+    {error, {credentials, _}} ->
+      {error, credentials};
+    {error, Message, _} when Retries > 0 ->
+      rabbit_log:warning("AWS request: ~s~nFailed with error: ~p", [Path, Message]),
+      timer:sleep(DelayIntervalMillis),
+      api_get_request_with_retries(Service, Path, Retries - 1, DelayIntervalMillis);
+    {error, Message, _} -> 
+      {error, Message}
   end.
